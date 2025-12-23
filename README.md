@@ -1,8 +1,8 @@
-# EDSpec Plugin for EDMarketConnector (SOON ONLINE!)
+# EDSpec Plugin for EDMarketConnector
 
 Plugin for [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) that syncs Elite Dangerous commander data to the [EDSpec](https://edspecbot.com) Discord bot service.
 
-**Version**: 1.0.0  
+**Version**: 1.0.1 
 **Developer**: sashathemiot
 
 ## Installation
