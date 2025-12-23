@@ -6,7 +6,7 @@ commander data including ships, credits, current location, and status.
 
 Requires an API key from EDSpec to authenticate requests.
 
-Version: 1.0.0
+Version: 1.0.1
 Developer: sashathemiot
 Website: https://edspecbot.com
 """
@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 from config import appname, config
 import timeout_session
 import tkinter as tk
+import tkinter.ttk as ttk
 import tkinter.messagebox as messagebox
 import myNotebook as nb
 
@@ -28,7 +29,7 @@ import myNotebook as nb
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f'{appname}.{plugin_name}')
 
-PLUGIN_VERSION = '1.0.0'
+PLUGIN_VERSION = '1.0.1'
 GITHUB_REPO = 'sashathemiot/edspec-ed-market-connector'
 
 # Configuration
@@ -149,7 +150,7 @@ def plugin_app(parent: tk.Frame) -> Tuple[tk.Label, tk.Label]:
     return label, status_label
 
 
-def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> nb.Frame:
+def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Frame:
     """
     Create the preferences panel in EDMarketConnector settings.
     
@@ -163,184 +164,243 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> nb.Frame:
     """
     global prefs_frame
     
-    frame = nb.Frame(parent)
-    frame.columnconfigure(1, weight=1)
+    logger.debug(f'plugin_prefs called: cmdr={cmdr}, is_beta={is_beta}')
     
-    # Title - EDSpec styled
-    title_label = nb.Label(frame, text='EDSpec', font=('Helvetica', 18, 'bold'))
-    title_label.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(15, 8), padx=(20, 5))
+    # Create the frame - this must succeed
+    try:
+        frame = nb.Frame(parent)
+        frame.columnconfigure(1, weight=1)
+    except Exception as e:
+        logger.exception(f'Error creating preferences frame: {e}')
+        # Last resort - create minimal frame
+        frame = nb.Frame(parent)
+        nb.Label(frame, text='Error: Could not create EDSpec preferences frame').pack()
+        return frame
     
-    # Subtitle
-    nb.Label(frame, text='A Discord bot for Elite Dangerous!', font=('Helvetica', 10)).grid(
-        row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 25), padx=(20, 5)
-    )
-    
-    # Description section
-    desc_text = (
-        'Connect your Elite Dangerous game data to the EDSpec Discord bot.\n\n'
-        'This integration automatically shares your commander data including:\n'
-        '• Your current location and system\n'
-        '• Station information when docked\n'
-        '• Active ship details\n'
-        '• Credit balance\n'
-        '• On-foot, docked, or undocked status\n\n'
-        'Your data is sent in real-time when game events occur like FSD jumps,\n'
-        'docking, or loadout changes.'
-    )
-    nb.Label(frame, text=desc_text, justify=tk.LEFT, wraplength=550, font=('Helvetica', 9)).grid(
-        row=2, column=0, columnspan=2, sticky=tk.W, pady=(0, 20), padx=(20, 5)
-    )
-    
-    # Enable checkbox
-    enabled_var = tk.BooleanVar(value=config.get(ENABLED_SETTING) if config.get(ENABLED_SETTING) is not None else True)
-    nb.Checkbutton(frame, text='Enable EDSpec integration', variable=enabled_var).grid(
-        row=3, column=0, columnspan=2, sticky=tk.W, pady=10, padx=(20, 5)
-    )
-    
-    # Privacy options section
-    nb.Label(frame, text='Privacy Options:', font=('Helvetica', 10)).grid(
-        row=4, column=0, columnspan=2, sticky=tk.W, pady=(20, 5), padx=(20, 5)
-    )
-    
-    send_ship_info_var = tk.BooleanVar(value=config.get(SEND_SHIP_INFO_SETTING) if config.get(SEND_SHIP_INFO_SETTING) is not None else True)
-    nb.Checkbutton(frame, text='Share additional data (ship, credits, on-foot status)', variable=send_ship_info_var).grid(
-        row=5, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(40, 5)
-    )
-    
-    nb.Label(frame, text='Note: System and station information is always shared', 
-             justify=tk.LEFT, wraplength=520, font=('Helvetica', 8), foreground='gray').grid(
-        row=6, column=0, columnspan=2, sticky=tk.W, pady=(0, 15), padx=(40, 5)
-    )
-    
-    # Update check section
-    nb.Label(frame, text='Updates:', font=('Helvetica', 10)).grid(
-        row=7, column=0, columnspan=2, sticky=tk.W, pady=(20, 5), padx=(20, 5)
-    )
-    
-    check_updates_var = tk.BooleanVar(value=config.get(CHECK_UPDATES_SETTING) if config.get(CHECK_UPDATES_SETTING) is not None else True)
-    nb.Checkbutton(frame, text='Check for updates on startup', variable=check_updates_var).grid(
-        row=8, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(40, 5)
-    )
-    
-    current_version_label = nb.Label(frame, text=f'Current version: {PLUGIN_VERSION}', 
-                                     font=('Helvetica', 8), foreground='gray')
-    current_version_label.grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(0, 15), padx=(40, 5))
-    
-    # API Key section
-    api_key_label = nb.Label(frame, text='API Key:')
-    api_key_label.grid(row=10, column=0, sticky=tk.W, pady=8, padx=(20, 5))
-    api_key_var = tk.StringVar(value=config.get(API_KEY_SETTING) if config.get(API_KEY_SETTING) else '')
-    api_key_entry = nb.Entry(frame, textvariable=api_key_var, width=50, show='*', font=('Helvetica', 9))
-    api_key_entry.grid(row=10, column=1, sticky=tk.W+tk.E, pady=8, padx=5)
-    
-    # Get API Key help text
-    get_key_text = 'Get your API key from https://edspecbot.com'
-    get_key_label = nb.Label(frame, text=get_key_text, cursor='hand2', underline=18)
-    get_key_label.grid(
-        row=11, column=0, columnspan=2, sticky=tk.W, pady=(0, 10), padx=(20, 5)
-    )
-    # Configure blue color and make the link clickable
-    get_key_label.config(foreground='#0000FF')  # Explicit blue hex color
-    get_key_label.bind('<Button-1>', lambda e: webbrowser.open('https://edspecbot.com'))
-    
-    # Connection test section
-    test_result_var = tk.StringVar(value='')
-    test_result_label = nb.Label(frame, textvariable=test_result_var, wraplength=500, font=('Helvetica', 9))
-    test_result_label.grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(20, 5))
-    
-    # Cooldown state for test button
-    test_button_cooldown_active = {'value': False}
-    
-    # Create button first so it can be referenced in the function
-    test_button = tk.Button(frame, text='Test Connection')
-    
-    def test_connection():
-        """Test the connection to the EDSpec API"""
-        # Check if cooldown is active
-        if test_button_cooldown_active['value']:
-            return
+    # Wrap all widget creation in try-except to ensure frame is always returned
+    try:
+        # Title - EDSpec styled
+        try:
+            title_label = nb.Label(frame, text='EDSpec', font=('Helvetica', 18, 'bold'))
+            title_label.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(15, 8), padx=(20, 5))
+        except Exception as e:
+            logger.exception(f'Error creating title label: {e}')
+            # Fallback to simple label without font
+            title_label = nb.Label(frame, text='EDSpec')
+            title_label.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(15, 8), padx=(20, 5))
+        # Subtitle
+        nb.Label(frame, text='A Discord bot for Elite Dangerous!', font=('Helvetica', 10)).grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 25), padx=(20, 5)
+        )
         
-        # Activate cooldown
-        test_button_cooldown_active['value'] = True
-        test_button.config(state='disabled')
-        original_text = test_button['text']
+        # Description section
+        desc_text = (
+            'Connect your Elite Dangerous game data to the EDSpec Discord bot.\n\n'
+            'This integration automatically shares your commander data including:\n'
+            '• Your current location and system\n'
+            '• Station information when docked\n'
+            '• Active ship details\n'
+            '• Credit balance\n'
+            '• On-foot, docked, or undocked status\n\n'
+            'Your data is sent in real-time when game events occur like FSD jumps,\n'
+            'docking, or loadout changes.'
+        )
+        nb.Label(frame, text=desc_text, justify=tk.LEFT, wraplength=550, font=('Helvetica', 9)).grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, pady=(0, 20), padx=(20, 5)
+        )
         
-        def reenable_button():
-            test_button_cooldown_active['value'] = False
-            test_button.config(state='normal', text=original_text)
+        # Enable checkbox
+        enabled_var = tk.BooleanVar(value=config.get(ENABLED_SETTING) if config.get(ENABLED_SETTING) is not None else True)
+        nb.Checkbutton(frame, text='Enable EDSpec integration', variable=enabled_var).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=10, padx=(20, 5)
+        )
         
-        def update_cooldown_text(seconds_left):
-            if seconds_left > 0:
-                test_button.config(text=f'Test Connection (cooldown: {seconds_left}s)')
-                frame.after(1000, lambda: update_cooldown_text(seconds_left - 1))
-            else:
-                reenable_button()
+        # Privacy options section
+        nb.Label(frame, text='Privacy Options:', font=('Helvetica', 10)).grid(
+            row=4, column=0, columnspan=2, sticky=tk.W, pady=(20, 5), padx=(20, 5)
+        )
         
-        # Start cooldown countdown
-        update_cooldown_text(10)
+        send_ship_info_var = tk.BooleanVar(value=config.get(SEND_SHIP_INFO_SETTING) if config.get(SEND_SHIP_INFO_SETTING) is not None else True)
+        nb.Checkbutton(frame, text='Share additional data (ship, credits, on-foot status)', variable=send_ship_info_var).grid(
+            row=5, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(40, 5)
+        )
         
-        test_result_var.set('Testing connection...')
-        frame.update_idletasks()
+        nb.Label(frame, text='Note: System and station information is always shared', 
+                 justify=tk.LEFT, wraplength=520, font=('Helvetica', 8), foreground='gray').grid(
+            row=6, column=0, columnspan=2, sticky=tk.W, pady=(0, 15), padx=(40, 5)
+        )
         
-        # Save the current API key to config before testing
-        if prefs_frame and hasattr(prefs_frame, 'api_key_var'):
-            config.set(API_KEY_SETTING, prefs_frame.api_key_var.get())
+        # Update check section
+        nb.Label(frame, text='Updates:', font=('Helvetica', 10)).grid(
+            row=7, column=0, columnspan=2, sticky=tk.W, pady=(20, 5), padx=(20, 5)
+        )
         
-        # Get the current value from the UI
-        current_api_key = api_key_var.get()
+        check_updates_var = tk.BooleanVar(value=config.get(CHECK_UPDATES_SETTING) if config.get(CHECK_UPDATES_SETTING) is not None else True)
+        nb.Checkbutton(frame, text='Check for updates on startup', variable=check_updates_var).grid(
+            row=8, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(40, 5)
+        )
         
-        def do_test():
-            try:
-                api_url = DEFAULT_API_URL
-                api_key = current_api_key
-                
-                if not api_key:
-                    test_result_var.set('❌ No API key configured')
-                    return
-                
-                session = timeout_session.new_session()
-                headers = {
-                    'Authorization': f'Bearer {api_key}',
-                    'Content-Type': 'application/json',
-                    'User-Agent': f'{appname}/{plugin_name}'
-                }
-                
-                data = {'connected': True, 'test': True}
-                response = session.post(api_url, json=data, headers=headers, timeout=10)
-                
-                if response.status_code == 200:
-                    test_result_var.set('✅ Connection successful!')
-                elif response.status_code == 401:
-                    test_result_var.set('❌ Authentication failed - check your API key')
+        current_version_label = nb.Label(frame, text=f'Current version: {PLUGIN_VERSION}', 
+                                         font=('Helvetica', 8), foreground='gray')
+        current_version_label.grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(0, 15), padx=(40, 5))
+        
+        # API Key section
+        api_key_label = nb.Label(frame, text='API Key:')
+        api_key_label.grid(row=10, column=0, sticky=tk.W, pady=8, padx=(20, 5))
+        api_key_var = tk.StringVar(value=config.get(API_KEY_SETTING) if config.get(API_KEY_SETTING) else '')
+        # Use ttk.Entry for password field (EntryMenu may not support show parameter)
+        api_key_entry = ttk.Entry(frame, textvariable=api_key_var, width=50, show='*')
+        api_key_entry.grid(row=10, column=1, sticky=tk.W+tk.E, pady=8, padx=5)
+        
+        # Get API Key help text
+        get_key_text = 'Get your API key from https://edspecbot.com'
+        get_key_label = nb.Label(frame, text=get_key_text, cursor='hand2', underline=18)
+        get_key_label.grid(
+            row=11, column=0, columnspan=2, sticky=tk.W, pady=(0, 10), padx=(20, 5)
+        )
+        # Configure blue color and make the link clickable
+        get_key_label.config(foreground='#0000FF')  # Explicit blue hex color
+        get_key_label.bind('<Button-1>', lambda e: webbrowser.open('https://edspecbot.com'))
+        
+        # Connection test section
+        test_result_var = tk.StringVar(value='')
+        test_result_label = nb.Label(frame, textvariable=test_result_var, wraplength=500, font=('Helvetica', 9))
+        test_result_label.grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(20, 5))
+        
+        # Cooldown state for test button
+        test_button_cooldown_active = {'value': False}
+        
+        # Create button first so it can be referenced in the function
+        test_button = tk.Button(frame, text='Test Connection')
+        
+        def test_connection():
+            """Test the connection to the EDSpec API"""
+            # Check if cooldown is active
+            if test_button_cooldown_active['value']:
+                return
+            
+            # Activate cooldown
+            test_button_cooldown_active['value'] = True
+            test_button.config(state='disabled')
+            original_text = test_button['text']
+            
+            def reenable_button():
+                test_button_cooldown_active['value'] = False
+                test_button.config(state='normal', text=original_text)
+            
+            def update_cooldown_text(seconds_left):
+                if seconds_left > 0:
+                    test_button.config(text=f'Test Connection (cooldown: {seconds_left}s)')
+                    frame.after(1000, lambda: update_cooldown_text(seconds_left - 1))
                 else:
-                    test_result_var.set(f'❌ Unexpected response: {response.status_code}')
+                    reenable_button()
+            
+            # Start cooldown countdown
+            update_cooldown_text(10)
+            
+            test_result_var.set('Testing connection...')
+            frame.update_idletasks()
+            
+            # Save the current API key to config before testing
+            if prefs_frame and hasattr(prefs_frame, 'api_key_var'):
+                config.set(API_KEY_SETTING, prefs_frame.api_key_var.get())
+            
+            # Get the current value from the UI
+            current_api_key = api_key_var.get()
+            
+            def do_test():
+                try:
+                    api_url = DEFAULT_API_URL
+                    api_key = current_api_key
                     
-            except Exception as e:
-                error_msg = str(e)
-                if 'getaddrinfo failed' in error_msg or 'NameResolutionError' in error_msg:
-                    test_result_var.set('❌ Failed to connect - check if the server is running')
-                elif 'Connection refused' in error_msg:
-                    test_result_var.set('❌ Connection refused - server may be down')
-                else:
-                    test_result_var.set(f'❌ Error: {error_msg[:60]}')
+                    if not api_key:
+                        test_result_var.set('❌ No API key configured')
+                        return
+                    
+                    session = timeout_session.new_session()
+                    headers = {
+                        'Authorization': f'Bearer {api_key}',
+                        'Content-Type': 'application/json',
+                        'User-Agent': f'{appname}/{plugin_name}'
+                    }
+                    
+                    data = {'connected': True, 'test': True}
+                    response = session.post(api_url, json=data, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        test_result_var.set('✅ Connection successful!')
+                    elif response.status_code == 401:
+                        test_result_var.set('❌ Authentication failed - check your API key')
+                    else:
+                        test_result_var.set(f'❌ Unexpected response: {response.status_code}')
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    if 'getaddrinfo failed' in error_msg or 'NameResolutionError' in error_msg:
+                        test_result_var.set('❌ Failed to connect - check if the server is running')
+                    elif 'Connection refused' in error_msg:
+                        test_result_var.set('❌ Connection refused - server may be down')
+                    else:
+                        test_result_var.set(f'❌ Error: {error_msg[:60]}')
+            
+            # Run test in a thread to avoid blocking UI
+            threading.Thread(target=do_test, daemon=True).start()
         
-        # Run test in a thread to avoid blocking UI
-        threading.Thread(target=do_test, daemon=True).start()
+        # Set the command after function is defined
+        test_button.config(command=test_connection)
+        test_button.grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(20, 5))
+        
+        # Store references for prefs_changed and prefs_cmdr_changed
+        frame.enabled_var = enabled_var
+        frame.api_key_var = api_key_var
+        frame.send_ship_info_var = send_ship_info_var
+        frame.check_updates_var = check_updates_var
+        frame.enabled_checkbutton = None  # Will be set if we need to reference it
+        
+        # Store the frame globally so prefs_changed can access it
+        prefs_frame = frame
+        
+        # Initialize UI based on current commander (if needed)
+        try:
+            prefs_cmdr_changed(cmdr, is_beta)
+        except Exception as e:
+            logger.exception(f'Error in prefs_cmdr_changed: {e}')
+        
+        logger.debug('plugin_prefs returning frame')
+    except Exception as e:
+        logger.exception(f'Error in plugin_prefs widget creation: {e}')
+        # Clear frame and add error message
+        for widget in frame.winfo_children():
+            widget.destroy()
+        nb.Label(frame, text=f'Error loading EDSpec preferences: {str(e)[:100]}').pack()
+        # Still return the frame so the tab appears
+        prefs_frame = frame
     
-    # Set the command after function is defined
-    test_button.config(command=test_connection)
-    test_button.grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(20, 5))
-    
-    # Store references for prefs_changed
-    frame.enabled_var = enabled_var
-    frame.api_key_var = api_key_var
-    frame.send_ship_info_var = send_ship_info_var
-    frame.check_updates_var = check_updates_var
-    
-    # Store the frame globally so prefs_changed can access it
-    prefs_frame = frame
-    
+    logger.debug('plugin_prefs returning frame (final)')
     return frame
+
+
+def prefs_cmdr_changed(cmdr: str | None, is_beta: bool) -> None:
+    """
+    Handle the Commander name changing whilst Settings was open.
+    
+    This function is called by EDMC when the commander changes while the
+    settings dialog is open. Since EDSpec uses global settings (not per-commander),
+    this mainly handles enabling/disabling UI elements based on beta status.
+    
+    Args:
+        cmdr: The new current Commander name (or None if no commander).
+        is_beta: Whether game beta was detected.
+    """
+    global prefs_frame
+    
+    if not prefs_frame:
+        return
+    
+    # EDSpec uses global settings, so we don't need to update per-commander data
+    # However, we could disable the plugin in beta if desired (similar to EDSM)
+    # For now, we'll just ensure the function exists for EDMC compatibility
+    pass
 
 
 def prefs_changed(cmdr: str, is_beta: bool) -> None:
