@@ -2,7 +2,7 @@
 
 Plugin for [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) that syncs Elite Dangerous commander data to the [EDSpec](https://edspecbot.com) Discord bot service.
 
-**Version**: 1.0.1 
+**Version**: 1.0.2 
 **Developer**: sashathemiot
 
 ## Installation
@@ -71,18 +71,50 @@ Plugin for [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) that s
 
 - `Not configured` (gray) - No API key
 - `Disabled` (orange) - Plugin disabled
-- `Disconnected (Xs)` (red) - Startup countdown (10s)
-- `Connecting...` (orange) - Connection attempt
-- `In Sync` (green) - Connected and syncing
-- `API Key invalid` (red) - Auth failed
-- `Connection failed` (red) - Connection error
+- `PLEASE START GAME` (orange) - API key set, but Elite Dangerous is not running or no commander is loaded
+- `Disconnected` (red) - Configured and enabled, but not yet connected to EDSpec
+- `In Sync` (green) - Connected and syncing. May include route or fuel details, for example `In Sync · Sol (2/5)` or `In Sync · 85% fuel`
+- `API Key invalid` (red) - Authentication failed
+- `Connection failed` (red) - Could not reach EDSpec
+- `Error` (red) - Status display error (check EDMC log)
 
 ## Data Events
 
-Sends data on journal events: `FSDJump`, `Location`, `Docked`, `Undocked`, `Loadout`, `Embark`, `Disembark`
+The plugin sends data only while you are in an active game session (after `LoadGame`).
 
-**Always sent**: Commander name, system, station  
-**Optional** (privacy setting): Ship, credits, status
+### Commander location (ingest API)
+
+Primary journal events: `FSDJump`, `Location`, `Docked`, `Undocked`, `Loadout`, `Embark`, `Disembark`
+
+Additional events:
+
+- **Fuel**: `Refuel`, `RefuelAll`, `FuelScoop` (fuel updates; optional ship/cargo/credits when privacy is on)
+- **Cargo**: `Cargo` (optional, privacy setting)
+- **Fleet**: `StoredShips` (optional, privacy setting)
+- **Frontier CAPI**: commander data when available
+
+**Always shared** while in game:
+
+- Commander name, current system, station when docked (cleared on `Undocked`)
+- Fuel level on jump, refuel, and fuel scoop events
+- Docked, undocked, or on-foot status on `FSDJump`, `Docked`, and `Undocked` (even when optional data is off)
+
+**Optional** (Settings → Share additional data):
+
+- Active ship name, credits, cargo, fleet ships, loadout details
+- On-foot, docked, or undocked status on all primary location events
+
+Fuel warnings, route display, and map audio are configured in the galaxy map Settings menu on the EDSpec website, not in ED Market Connector.
+
+### In-game route (active-route API)
+
+Synced from journal events: `NavRoute`, `Route`, `FSDTarget`
+
+Cleared on `NavRouteClear` or when the route is completed.
+
+### FSS signals (ingest API)
+
+From `FSSSignalDiscovered` for expiring signals only (`TimeRemaining` > 0). Signals are batched briefly and sent before the next jump.
 
 ## Requirements
 
