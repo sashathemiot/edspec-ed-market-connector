@@ -2,7 +2,7 @@
 
 Plugin for [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) that syncs Elite Dangerous commander data to the [EDSpec](https://edspecbot.com) Discord bot service.
 
-**Version**: 1.0.2 
+**Version**: 1.1.0 
 **Developer**: sashathemiot
 
 ## Installation
@@ -35,15 +35,24 @@ Plugin for [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) that s
    - Mac: `~/Library/Application Support/EDMarketConnector/plugins/EDSpec/`
    - Linux: `~/.local/share/EDMarketConnector/plugins/EDSpec/`
 
-### Step 3: Copy Plugin File
+### Step 3: Install Plugin Files
 
-1. Copy the `load.py` file from this repository
-2. Paste it into the `EDSpec` folder you just created
+**From a release zip (recommended):**
+
+1. Download `EDSpec-1.1.0.zip` from GitHub Releases
+2. Extract so you have an `EDSpec` folder
+3. Move that folder into the EDMarketConnector `plugins` directory
+
+**From source:**
+
+1. Create the `EDSpec` folder in the plugins directory
+2. Copy at least `load.py` and `LICENSE` into it
 3. Verify the file structure:
    ```
    plugins/
      └── EDSpec/
-         └── load.py
+         ├── load.py
+         └── LICENSE
    ```
 
 ### Step 4: Restart EDMarketConnector
@@ -62,16 +71,16 @@ Plugin for [EDMarketConnector](https://github.com/EDCD/EDMarketConnector) that s
 
 ## Configuration
 
-1. Get API key from https://edspecbot.com (Discord login required)
-2. Open EDMarketConnector Settings → EDSpec tab
-3. Enter API key and configure privacy options
-4. Use "Test Connection" button (10s cooldown)
+1. Get an API key from https://edspecbot.com (Discord login required)
+2. Open EDMarketConnector Settings, then the EDSpec tab
+3. Turn the plugin on, choose what to share, and enter the API key
+4. Use Test connection
 
 ## Status Indicators
 
 - `Not configured` (gray) - No API key
 - `Disabled` (orange) - Plugin disabled
-- `PLEASE START GAME` (orange) - API key set, but Elite Dangerous is not running or no commander is loaded
+- `Please join a game mode` (orange) - API key set, but Elite Dangerous is not running or no commander is loaded
 - `Disconnected` (red) - Configured and enabled, but not yet connected to EDSpec
 - `In Sync` (green) - Connected and syncing. May include route or fuel details, for example `In Sync · Sol (2/5)` or `In Sync · 85% fuel`
 - `API Key invalid` (red) - Authentication failed
@@ -84,25 +93,24 @@ The plugin sends data only while you are in an active game session (after `LoadG
 
 ### Commander location (ingest API)
 
-Primary journal events: `FSDJump`, `Location`, `Docked`, `Undocked`, `Loadout`, `Embark`, `Disembark`
+Primary journal events: `FSDJump`, `CarrierJump`, `Location`, `Docked`, `Undocked`, `Loadout`, `Embark`, `Disembark`
 
 Additional events:
 
-- **Fuel**: `Refuel`, `RefuelAll`, `FuelScoop` (fuel updates; optional ship/cargo/credits when privacy is on)
-- **Cargo**: `Cargo` (optional, privacy setting)
-- **Fleet**: `StoredShips` (optional, privacy setting)
+- **Fuel**: live tank level while you are in your ship, plus `Refuel`, `RefuelAll`, and `FuelScoop`
+- **Cargo**: `Cargo` (optional)
+- **Fleet**: `StoredShips` (optional)
 - **Frontier CAPI**: commander data when available
 
 **Always shared** while in game:
 
 - Commander name, current system, station when docked (cleared on `Undocked`)
-- Fuel level on jump, refuel, and fuel scoop events
-- Docked, undocked, or on-foot status on `FSDJump`, `Docked`, and `Undocked` (even when optional data is off)
+- Fuel level while you fly, scoop, or jump
+- Docked, undocked, or on-foot status on location updates (`FSDJump`, `CarrierJump`, `Location`, `Docked`, `Undocked`, `Embark`, `Disembark`)
 
-**Optional** (Settings → Share additional data):
+**Optional** (Share ship, credits, Merc coins, cargo and fleet):
 
-- Active ship name, credits, cargo, fleet ships, loadout details
-- On-foot, docked, or undocked status on all primary location events
+- Active ship name, credits, Merc coins, cargo, fleet ships, and loadout details
 
 Fuel warnings, route display, and map audio are configured in the galaxy map Settings menu on the EDSpec website, not in ED Market Connector.
 
@@ -112,15 +120,19 @@ Synced from journal events: `NavRoute`, `Route`, `FSDTarget`
 
 Cleared on `NavRouteClear` or when the route is completed.
 
-### FSS signals (ingest API)
+### FSS scans (ingest API)
 
-From `FSSSignalDiscovered` for expiring signals only (`TimeRemaining` > 0). Signals are batched briefly and sent before the next jump.
+Body scans, mapped bodies, discovery progress, and a finished system scan (`FSSAllBodiesFound`) are sent. Expiring FSS signals are not shared.
 
 ## Requirements
 
-- EDMarketConnector 4.0.0+
-- EDSpec API key (Discord account)
+- EDMarketConnector **6.1.0+** (required for the EDMC Plugin Browser and this plugin)
+- EDSpec API key from https://edspecbot.com (Discord account)
 
 ## License
 
-Provided as-is for use with EDMarketConnector and EDSpec.
+This plugin is free software under the [GNU General Public License v3.0](LICENSE) (GPL-3.0).
+
+You may redistribute and/or modify it under the terms of the GPL as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.

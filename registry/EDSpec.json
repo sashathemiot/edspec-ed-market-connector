@@ -1,0 +1,22 @@
+{
+  "pluginName": "EDSpec",
+  "pluginVer": "1.1.0",
+  "autoUpdateEnabled": false,
+  "autoInstallEnabled": false,
+  "pluginAuthors": ["sashathemiot"],
+  "pluginMainLink": "https://github.com/sashathemiot/edspec-ed-market-connector",
+  "pluginLastUpdate": "2026-11-01",
+  "pluginDirName": "EDSpec",
+  "pluginCategory": ["Social", "Navigation", "Exploration", "Utility"],
+  "pluginDesc": "Syncs commander location, fuel, nav routes, and optional ship data to the EDSpec Discord bot and galaxy map.",
+  "pluginLastTestedEDMC": "6.1.0",
+  "pluginRequirements": [
+    "EDMarketConnector 6.1.0+",
+    "EDSpec API key from https://edspecbot.com"
+  ],
+  "pluginLicense": "GPL-3.0-or-later",
+  "pluginZip": "https://github.com/sashathemiot/edspec-ed-market-connector/releases/download/1.1.0/EDSpec-1.1.0.zip",
+  "pluginHash": "af14cfa66c4d2192ec160c509bf1c3256388867e2d599953718742d23a14da2f",
+  "pluginIcon": "https://edspecbot.com/logo.png",
+  "pluginVT": ""
+}

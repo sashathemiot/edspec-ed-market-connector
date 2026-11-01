@@ -1,0 +1,106 @@
+{
+  "versions": [
+    {
+      "version": "1.1.0",
+      "date": "2026-11-01",
+      "type": "minor",
+      "changes": [
+        {
+          "type": "improved",
+          "description": "Fuel level updates while you fly, scoop, or jump."
+        },
+        {
+          "type": "added",
+          "description": "Merc coin balance is saved with extra ship data."
+        },
+        {
+          "type": "added",
+          "description": "Buying, switching, transferring, or renaming a ship updates your hangar right away."
+        },
+        {
+          "type": "added",
+          "description": "Module changes update that module. Jump range, hull, and rebuy update on the next loadout."
+        },
+        {
+          "type": "changed",
+          "description": "Updated the settings screen."
+        },
+        {
+          "type": "changed",
+          "description": "Idle status now says Please join a game mode."
+        },
+        {
+          "type": "improved",
+          "description": "A jump or dock updates the current ship's system right away."
+        },
+        {
+          "type": "fixed",
+          "description": "Sold ships leave the hangar. A full ship list also drops ships you no longer own."
+        },
+        {
+          "type": "removed",
+          "description": "The local address hint is gone, and FSS signals are no longer shared."
+        }
+      ]
+    },
+    {
+      "version": "1.0.2",
+      "date": "2026-07-02",
+      "type": "minor",
+      "changes": [
+        {
+          "type": "added",
+          "description": "Plot a route in Elite and see it on the EDSpec galaxy map. Jump progress also shows in ED Market Connector, for example Sol (2/5)."
+        },
+        {
+          "type": "added",
+          "description": "Timed unknown signal sources you discover in the FSS scanner can be shared with EDSpec for community stats. Stations and permanent contacts are not included."
+        },
+        {
+          "type": "added",
+          "description": "Fuel level in the EDMC status bar, plus optional sync for cargo, other ships in your fleet, and module loadouts."
+        },
+        {
+          "type": "added",
+          "description": "The plugin only sends data while you are in game. If Elite is not running, the status shows PLEASE START GAME."
+        },
+        {
+          "type": "fixed",
+          "description": "Your synced route no longer vanishes during hyperspace jumps. After you finish the route, it stays on EDSpec for about 30 seconds before clearing."
+        },
+        {
+          "type": "changed",
+          "description": "Clearer privacy in settings: your commander, system, station, fuel, and docked or on-foot status are always shared while in game. Ship, credits, cargo, fleet, and loadout stay optional."
+        }
+      ]
+    },
+    {
+      "version": "1.0.1",
+      "date": "2025-12-20",
+      "changes": [
+        {
+          "type": "fixed",
+          "description": "Fixed EDSpec settings tab not appearing in EDMC settings dialog"
+        },
+        {
+          "type": "fixed",
+          "description": "Fixed API key entry field compatibility issue (nb.Entry → ttk.Entry)"
+        },
+        {
+          "type": "improved",
+          "description": "Improved error handling to ensure settings tab always appears"
+        }
+      ]
+    },
+    {
+      "version": "1.0.0",
+      "date": "2025-10-27",
+      "changes": [
+        {
+          "type": "added",
+          "description": "First release of ED Market Connector plugin"
+        }
+      ]
+    }
+  ]
+}

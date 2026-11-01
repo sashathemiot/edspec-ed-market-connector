@@ -6,36 +6,45 @@ commander data including ships, credits, current location, and status.
 
 Requires an API key from EDSpec to authenticate requests.
 
-Version: 1.0.2
+Version: 1.1.0
 Developer: sashathemiot
 Website: https://edspecbot.com
+
+Copyright (C) 2025-2026 sashathemiot
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
+import base64
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import webbrowser
 from calendar import timegm
 from time import strptime
 from typing import Callable, Optional, Tuple
+from urllib.parse import urlparse
 
 from config import appname, config
 import timeout_session
 import tkinter as tk
 import tkinter.messagebox as messagebox
-import tkinter.ttk as ttk
 import myNotebook as nb
 
-# EDMC < 5.0 config API compatibility (see PLUGINS.md)
-if not hasattr(config, 'get_int'):
-    config.get_int = config.getint
-if not hasattr(config, 'get_str'):
-    config.get_str = config.get
-if not hasattr(config, 'get_bool'):
-    config.get_bool = lambda key: bool(config.getint(key))
-if not hasattr(config, 'get_list'):
-    config.get_list = config.get
+# Requires EDMarketConnector 6.1.0+ (Plugin Browser and modern config API).
 
 plugin_name = os.path.basename(os.path.dirname(__file__))
 logger = logging.getLogger(f'{appname}.{plugin_name}')
@@ -47,8 +56,7 @@ if not logger.hasHandlers():
     ))
     logger.addHandler(_log_handler)
 
-VERSION = '1.0.2'
-PLUGIN_VERSION = VERSION
+VERSION = '1.1.0'
 GITHUB_REPO = 'sashathemiot/edspec-ed-market-connector'
 
 API_KEY_SETTING = f'{plugin_name}.api_key'
@@ -60,14 +68,21 @@ CHECK_UPDATES_SETTING = f'{plugin_name}.check_updates'
 DEFAULT_API_URL = 'https://api.edspecbot.com/edmc/ingest'
 JOURNAL_ERROR_MESSAGE = 'EDSpec could not send data. Check the log for details.'
 
+# Same tokens as the website: zinc background, orange accent.
+ED_BG = '#18181b'
+ED_TEXT = '#ffffff'
+ED_MUTED = '#a1a1aa'
+ED_AMBER = '#f97316'
+ED_AMBER_HOVER = '#fb923c'
+ED_FIELD = '#27272a'
+ED_LINE = '#3f3f46'
+ED_FONT = ('Segoe UI', 9)
+
 JOB_COMMANDER = 'commander'
 JOB_PING = 'ping'
 JOB_ROUTE_SET = 'route_set'
 JOB_ROUTE_CLEAR = 'route_clear'
 JOB_ROUTE_STATE_RETRY = 'route_state_retry'
-JOB_FSS_SIGNALS = 'fss_signals'
-
-FSS_FLUSH_DEBOUNCE_SEC = 2
 work_queue: Optional[queue.Queue] = None
 worker_thread: Optional[threading.Thread] = None
 ping_thread: Optional[threading.Thread] = None
@@ -80,6 +95,7 @@ prefs_frame: Optional[object] = None
 last_connection_status = 'disconnected'
 current_cmdr = ''
 current_system = ''
+current_station = ''
 latest_journal_state: dict = {}
 game_session_active = False
 active_route = None
@@ -89,7 +105,25 @@ suppressed_fsd_target: Optional[str] = None
 game_session_start_ts: Optional[int] = None
 last_enqueued_route_signature: Optional[str] = None
 route_completion_timer: Optional[threading.Timer] = None
+route_cancel_timer: Optional[threading.Timer] = None
+route_clear_pending = False
+route_clear_requested_at = 0.0
+route_jump_hold = False
+route_jump_released_at = 0.0
+suppressed_route_hops: set = set()
+suppress_route_hops_until = 0.0
 ROUTE_COMPLETE_CLEAR_SEC = 30
+ROUTE_CANCEL_CONFIRM_SEC = 2
+ROUTE_CANCEL_MAX_SEC = 20
+FSD_CHARGING_FLAG = 1 << 17
+FSD_JUMP_FLAG = 1 << 30
+IN_FIGHTER_FLAG = 1 << 25
+IN_SRV_FLAG = 1 << 26
+FUEL_LIVE_INTERVAL_SEC = 2.0
+last_live_fuel_sent_at = 0.0
+last_live_fuel_level: Optional[float] = None
+live_fuel_pending: Optional[float] = None
+live_fuel_timer: Optional[threading.Timer] = None
 nav_route_state_retry_timer: Optional[threading.Timer] = None
 nav_route_state_retry_gen = 0
 NAV_ROUTE_STATE_RETRY_DELAYS_SEC = (0.1, 0.25, 0.5, 1.0, 2.0)
@@ -100,10 +134,7 @@ active_fuel_capacity_cache: Optional[float] = None
 cargo_cache: list = []
 cargo_count_cache: int = 0
 cargo_vessel_cache: str = 'Ship'
-pending_fss_system_address: Optional[int] = None
-pending_fss_timestamp: Optional[str] = None
-pending_fss_signals: list = []
-fss_flush_timer: Optional[threading.Timer] = None
+merc_coins_cache: Optional[int] = None
 status_label: Optional[tk.Label] = None
 
 
@@ -112,10 +143,14 @@ def user_agent() -> str:
     return f'{base} (EDSpec/{VERSION})'
 
 
+def config_bool(setting: str, default: bool = True) -> bool:
+    if config.get(setting) is None:
+        return default
+    return bool(config.get_bool(setting))
+
+
 def is_plugin_enabled() -> bool:
-    if config.get(ENABLED_SETTING) is None:
-        return True
-    return bool(config.get_bool(ENABLED_SETTING))
+    return config_bool(ENABLED_SETTING)
 
 
 def get_api_key() -> str:
@@ -123,15 +158,11 @@ def get_api_key() -> str:
 
 
 def send_ship_info_enabled() -> bool:
-    if config.get(SEND_SHIP_INFO_SETTING) is None:
-        return True
-    return bool(config.get_bool(SEND_SHIP_INFO_SETTING))
+    return config_bool(SEND_SHIP_INFO_SETTING)
 
 
 def check_updates_enabled() -> bool:
-    if config.get(CHECK_UPDATES_SETTING) is None:
-        return True
-    return bool(config.get_bool(CHECK_UPDATES_SETTING))
+    return config_bool(CHECK_UPDATES_SETTING)
 
 
 def get_api_url() -> str:
@@ -194,6 +225,99 @@ def sync_game_session_from_journal(cmdr: Optional[str], system: Optional[str], s
     set_game_session_active(commander_in_game(cmdr, system, state))
 
 
+def _optional_journal_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _optional_journal_bool(value):
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def enqueue_fss_progress(cmdr: str, system: str, entry: dict) -> None:
+    system_name = entry.get('SystemName') or entry.get('StarSystem') or system
+    if not isinstance(system_name, str) or not system_name.strip():
+        return
+    body_count = entry.get('BodyCount')
+    progress = entry.get('Progress')
+    enqueue_commander({
+        'cmdr': cmdr,
+        'system': system_name.strip(),
+        'fssProgress': {
+            'systemName': system_name.strip(),
+            'systemAddress': entry.get('SystemAddress'),
+            'bodyCount': body_count if isinstance(body_count, int) and not isinstance(body_count, bool) else None,
+            'progress': progress if isinstance(progress, (int, float)) and not isinstance(progress, bool) else None,
+            'timestamp': entry.get('timestamp'),
+        },
+    })
+
+
+def enqueue_fss_scan_complete(cmdr: str, system: str, entry: dict) -> None:
+    system_name = entry.get('SystemName') or entry.get('StarSystem') or system
+    if not isinstance(system_name, str) or not system_name.strip():
+        return
+    count = entry.get('Count')
+    enqueue_commander({
+        'cmdr': cmdr,
+        'system': system_name.strip(),
+        'fssScanComplete': {
+            'systemName': system_name.strip(),
+            'systemAddress': entry.get('SystemAddress'),
+            'bodyCount': count if isinstance(count, int) and not isinstance(count, bool) else None,
+            'timestamp': entry.get('timestamp'),
+        },
+    })
+
+
+def enqueue_fss_mapped(cmdr: str, system: str, entry: dict) -> None:
+    body_name = entry.get('BodyName')
+    if not isinstance(body_name, str) or not body_name.strip():
+        return
+    body_id = entry.get('BodyID')
+    enqueue_commander({
+        'cmdr': cmdr,
+        'system': entry.get('StarSystem') or system,
+        'fssMapped': {
+            'bodyName': body_name.strip(),
+            'bodyId': body_id if isinstance(body_id, int) and not isinstance(body_id, bool) else None,
+            'systemAddress': entry.get('SystemAddress'),
+            'timestamp': entry.get('timestamp'),
+        },
+    })
+
+
+def enqueue_fss_scan(cmdr: str, system: str, entry: dict) -> None:
+    body_name = entry.get('BodyName')
+    if not isinstance(body_name, str) or not body_name.strip():
+        return
+    planet_class = entry.get('PlanetClass')
+    atmosphere = entry.get('Atmosphere')
+    enqueue_commander({
+        'cmdr': cmdr,
+        'system': entry.get('StarSystem') or system,
+        'fssPlanet': {
+            'bodyName': body_name.strip(),
+            'planetClass': planet_class.strip() if isinstance(planet_class, str) else '',
+            'terraformable': entry.get('TerraformState') == 'Terraformable',
+            'wasDiscovered': _optional_journal_bool(entry.get('WasDiscovered')),
+            'wasMapped': _optional_journal_bool(entry.get('WasMapped')),
+            'distanceFromArrivalLs': _optional_journal_number(entry.get('DistanceFromArrivalLS')),
+            'landable': _optional_journal_bool(entry.get('Landable')),
+            'atmosphere': atmosphere.strip() if isinstance(atmosphere, str) else None,
+            'surfaceTemperature': _optional_journal_number(entry.get('SurfaceTemperature')),
+            'massEarth': _optional_journal_number(entry.get('MassEM')),
+            'systemName': entry.get('StarSystem') or system,
+            'systemAddress': entry.get('SystemAddress'),
+            'bodyId': entry.get('BodyID'),
+            'timestamp': entry.get('timestamp'),
+        },
+    })
+
+
 def enqueue_commander(data: dict) -> None:
     if not game_session_active:
         logger.debug('Skipping commander payload: commander not in game')
@@ -201,6 +325,8 @@ def enqueue_commander(data: dict) -> None:
     enqueue_job(JOB_COMMANDER, data)
 
 
+def location_payload(cmdr: Optional[str], system: Optional[str], station: Optional[str]) -> dict:
+    return {'cmdr': cmdr, 'system': system, 'station': station}
 
 
 def get_active_route_api_url() -> str:
@@ -212,7 +338,6 @@ def get_active_route_api_url() -> str:
     ):
         if api_url.endswith(ingest_path):
             return f'{api_url[:-len(ingest_path)]}/edmc/active-route'
-    from urllib.parse import urlparse
     parsed = urlparse(api_url)
     return f'{parsed.scheme}://{parsed.netloc}/edmc/active-route'
 
@@ -272,9 +397,12 @@ def _apply_route_cleared_state() -> None:
 
 def _apply_route_posted_state(payload: dict) -> None:
     global active_route, active_route_hop_index, suppressed_fsd_target
+    global suppressed_route_hops, suppress_route_hops_until
     active_route = payload
     active_route_hop_index = -1
     suppressed_fsd_target = None
+    suppressed_route_hops = set()
+    suppress_route_hops_until = 0.0
     cancel_route_completion_clear()
     apply_system_to_route_progress(current_system)
 
@@ -331,7 +459,7 @@ def _worker_sync_route(session, route_steps: Optional[list]) -> None:
 
 
 def _worker_route_state_retry(attempt: int) -> None:
-    if not game_session_active:
+    if not game_session_active or route_clear_pending:
         return
     nav_route = latest_journal_state.get('NavRoute')
     if isinstance(nav_route, dict) and nav_route.get('Route'):
@@ -368,23 +496,6 @@ def prepend_current_system(route_steps: list, state: dict) -> list:
         'StarPos': star_pos_from_state(state),
     }
     return [origin, *route_steps]
-
-
-def route_steps_from_edmc(entry: dict, state: dict) -> list:
-    route_steps = entry.get('Route')
-    if isinstance(route_steps, list) and route_steps:
-        return route_steps
-
-    if not route_trust_state_nav_route:
-        return []
-
-    nav_route = state.get('NavRoute')
-    if isinstance(nav_route, dict) and not is_nav_route_clear(nav_route):
-        nav_steps = nav_route.get('Route')
-        if isinstance(nav_steps, list) and nav_steps:
-            return nav_steps
-
-    return []
 
 
 def schedule_nav_route_state_retry(attempt: int = 0) -> None:
@@ -461,36 +572,125 @@ def handle_nav_route_state(nav_route: Optional[dict], state: Optional[dict] = No
 
     route_steps = nav_route.get('Route')
     if route_steps:
+        if route_clear_pending:
+            return
         global route_trust_state_nav_route
         route_trust_state_nav_route = True
         enqueue_route_sync(route_steps, game_state)
 
 
-def request_route_clear_from_game() -> None:
-    """Schedule route clear after ROUTE_COMPLETE_CLEAR_SEC (Elite often spams NavRouteClear in hyperspace)."""
-    cancel_route_completion_clear()
-    if active_route and not is_route_complete():
-        logger.debug('Ignoring route clear while hops remain')
+def status_flags(state: Optional[dict]) -> int:
+    if not isinstance(state, dict):
+        return 0
+    try:
+        return int(state.get('Flags') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def hyperspace_route_hold(state: Optional[dict] = None) -> bool:
+    game_state = state if isinstance(state, dict) else latest_journal_state
+    flags = status_flags(game_state)
+    if flags & (FSD_CHARGING_FLAG | FSD_JUMP_FLAG):
+        return True
+    return route_jump_hold
+
+
+def cancel_route_cancel_confirm() -> None:
+    global route_cancel_timer, route_clear_pending
+    route_clear_pending = False
+    if route_cancel_timer is not None:
+        route_cancel_timer.cancel()
+        route_cancel_timer = None
+
+
+def schedule_route_cancel_confirm() -> None:
+    global route_cancel_timer, route_clear_pending, route_clear_requested_at
+    if not route_clear_pending:
+        route_clear_requested_at = time.time()
+    route_clear_pending = True
+    if route_cancel_timer is not None:
+        route_cancel_timer.cancel()
+        route_cancel_timer = None
+
+    def _fire() -> None:
+        global route_cancel_timer
+        route_cancel_timer = None
+        confirm_route_removed()
+
+    route_cancel_timer = threading.Timer(ROUTE_CANCEL_CONFIRM_SEC, _fire)
+    route_cancel_timer.daemon = True
+    route_cancel_timer.start()
+
+
+def confirm_route_removed() -> None:
+    """Clear the plot once NavRouteClear sticks. A newer NavRoute event cancels this."""
+    global route_clear_pending
+    if not route_clear_pending:
         return
-    schedule_route_completion_clear()
+    # Only a jump we saw start should delay the delete. Status flags can stay set
+    # after the last journal line and would otherwise block the clear forever.
+    jump_hold = route_jump_hold or (
+        route_jump_released_at and time.time() - route_jump_released_at < ROUTE_CANCEL_CONFIRM_SEC
+    )
+    if jump_hold and time.time() - route_clear_requested_at < ROUTE_CANCEL_MAX_SEC:
+        schedule_route_cancel_confirm()
+        return
+    if is_route_complete() and not jump_hold:
+        route_clear_pending = False
+        schedule_route_completion_clear()
+        return
+
+    route_clear_pending = False
+    logger.info('In-game nav route removed; resetting EDSpec route plot')
+    enqueue_route_clear()
+
+
+def remember_cleared_route_hops() -> None:
+    global suppressed_fsd_target, suppressed_route_hops, suppress_route_hops_until
+    if not isinstance(active_route, dict):
+        return
+    hops = active_route.get('hops') or []
+    clear_dest = active_route.get('to')
+    suppressed_fsd_target = str(clear_dest).strip() if clear_dest else None
+    suppressed_route_hops = {_system_key(str(hop)) for hop in hops if hop}
+    if suppressed_fsd_target:
+        suppressed_route_hops.add(_system_key(suppressed_fsd_target))
+    suppress_route_hops_until = time.time() + 15
+
+
+def request_route_clear_from_game(state: Optional[dict] = None) -> None:
+    """Reset the plot when the player removes it. Hyperspace also emits NavRouteClear, then a new NavRoute."""
+    global route_trust_state_nav_route
+    cancel_route_completion_clear()
+    cancel_nav_route_state_retry()
+    # Do not let a stale NavRoute still sitting in EDMC state recreate the plot.
+    route_trust_state_nav_route = False
+    if active_route and is_route_complete() and not hyperspace_route_hold(state):
+        logger.info('In-game nav route cleared after arrival; removing EDSpec route plot')
+        schedule_route_completion_clear()
+        return
+    remember_cleared_route_hops()
+    if hyperspace_route_hold(state):
+        logger.info('NavRouteClear during a jump; route resets if it stays empty')
+    else:
+        logger.info('NavRouteClear received; route resets if it stays empty')
+    schedule_route_cancel_confirm()
 
 
 def handle_journal_route_event(entry: dict, state: dict) -> None:
     global route_trust_state_nav_route
 
     if is_nav_route_clear(entry):
-        cancel_route_completion_clear()
-        if active_route and not is_route_complete():
-            logger.debug('Ignoring NavRouteClear mid-route (hyperspace)')
-            return
-        logger.info('In-game nav route cleared; removing EDSpec route plot')
-        request_route_clear_from_game()
+        request_route_clear_from_game(state)
         return
 
-    route_trust_state_nav_route = True
-    steps = route_steps_from_edmc(entry, state)
-    if steps:
+    steps = entry.get('Route')
+    if isinstance(steps, list) and steps:
+        route_trust_state_nav_route = True
         enqueue_route_sync(steps, state)
+        return
+    if route_clear_pending:
         return
     schedule_nav_route_state_retry(0)
 
@@ -514,7 +714,7 @@ def handle_fsd_target(entry: dict, state: dict) -> None:
             enqueue_route_clear()
         return
 
-    if fsd_target_is_suppressed(target_name):
+    if route_clear_pending or fsd_target_is_suppressed(target_name):
         logger.debug('Ignoring suppressed FSD target after route clear: %s', target_name.strip())
         return
 
@@ -535,6 +735,7 @@ def enqueue_route_sync(route_steps: Optional[list], state: Optional[dict] = None
     if not game_session_active:
         return
     cancel_route_completion_clear()
+    cancel_route_cancel_confirm()
     cancel_nav_route_state_retry()
     game_state = state if isinstance(state, dict) else latest_journal_state
     steps = route_steps if route_steps is not None else []
@@ -591,11 +792,9 @@ def route_sync_signature(payload: dict) -> str:
 
 
 def mark_route_cleared() -> None:
-    global route_trust_state_nav_route, suppressed_fsd_target, last_enqueued_route_signature
+    global route_trust_state_nav_route, last_enqueued_route_signature
 
-    clear_dest = active_route.get('to') if isinstance(active_route, dict) else None
-    suppressed_fsd_target = str(clear_dest).strip() if clear_dest else None
-
+    remember_cleared_route_hops()
     route_trust_state_nav_route = False
     last_enqueued_route_signature = None
     cancel_nav_route_state_retry()
@@ -606,13 +805,17 @@ def is_ingame_active_route() -> bool:
 
 
 def fsd_target_is_suppressed(target_name: Optional[str]) -> bool:
-    if not suppressed_fsd_target or not target_name:
+    if not target_name:
         return False
-    return _system_key(target_name) == _system_key(suppressed_fsd_target)
+    key = _system_key(target_name)
+    if suppressed_fsd_target and key == _system_key(suppressed_fsd_target):
+        return True
+    return time.time() < suppress_route_hops_until and key in suppressed_route_hops
 
 
 def enqueue_route_clear() -> None:
     mark_route_cleared()
+    _apply_route_cleared_state()
     enqueue_job(JOB_ROUTE_CLEAR, None)
 
 
@@ -740,109 +943,6 @@ def enqueue_ping(connected: bool = True) -> None:
     enqueue_job(JOB_PING, connected)
 
 
-def enqueue_fss_signals(payload: dict) -> None:
-    enqueue_job(JOB_FSS_SIGNALS, payload)
-
-
-def clear_pending_fss_batch() -> None:
-    global pending_fss_system_address, pending_fss_timestamp, pending_fss_signals, fss_flush_timer
-    pending_fss_system_address = None
-    pending_fss_timestamp = None
-    pending_fss_signals = []
-    if fss_flush_timer is not None:
-        fss_flush_timer.cancel()
-        fss_flush_timer = None
-
-
-def flush_pending_fss_signals() -> None:
-    """Send batched expiring FSS signals to EDSpec."""
-    global pending_fss_system_address, pending_fss_timestamp, pending_fss_signals, fss_flush_timer
-
-    if fss_flush_timer is not None:
-        fss_flush_timer.cancel()
-        fss_flush_timer = None
-
-    if not pending_fss_signals or pending_fss_system_address is None:
-        clear_pending_fss_batch()
-        return
-
-    payload = {
-        'fssSignals': {
-            'systemAddress': pending_fss_system_address,
-            'timestamp': pending_fss_timestamp or time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'signals': list(pending_fss_signals),
-        }
-    }
-    clear_pending_fss_batch()
-    enqueue_fss_signals(payload)
-
-
-def schedule_fss_flush() -> None:
-    global fss_flush_timer
-
-    if fss_flush_timer is not None:
-        fss_flush_timer.cancel()
-
-    fss_flush_timer = threading.Timer(FSS_FLUSH_DEBOUNCE_SEC, flush_pending_fss_signals)
-    fss_flush_timer.daemon = True
-    fss_flush_timer.start()
-
-
-def fss_signal_from_journal_entry(entry: dict) -> Optional[dict]:
-    """Build one EDDN-shaped signal row; only expiring signals (TimeRemaining > 0)."""
-    time_remaining = entry.get('TimeRemaining')
-    if time_remaining is None:
-        return None
-
-    try:
-        remaining = int(time_remaining)
-    except (TypeError, ValueError):
-        return None
-
-    if remaining <= 0:
-        return None
-
-    signal_name = entry.get('SignalName')
-    if not signal_name:
-        return None
-
-    return {
-        'SignalName': signal_name,
-        'SignalType': entry.get('SignalType'),
-        'IsStation': entry.get('IsStation'),
-        'USSType': entry.get('USSType'),
-        'TimeRemaining': remaining,
-        'SpawningState': entry.get('SpawningState'),
-        'SpawningFaction': entry.get('SpawningFaction'),
-        'SpawningPower': entry.get('SpawningPower'),
-        'OpposingPower': entry.get('OpposingPower'),
-        'ThreatLevel': entry.get('ThreatLevel'),
-        'timestamp': entry.get('timestamp'),
-    }
-
-
-def queue_fss_signal_from_entry(entry: dict) -> None:
-    global pending_fss_system_address, pending_fss_timestamp, pending_fss_signals
-
-    signal = fss_signal_from_journal_entry(entry)
-    if not signal:
-        return
-
-    system_address = entry.get('SystemAddress')
-    try:
-        system_address = int(system_address)
-    except (TypeError, ValueError):
-        return
-
-    if pending_fss_system_address not in (None, system_address):
-        flush_pending_fss_signals()
-
-    pending_fss_system_address = system_address
-    pending_fss_timestamp = entry.get('timestamp') or pending_fss_timestamp
-    pending_fss_signals.append(signal)
-    schedule_fss_flush()
-
-
 def normalize_ship_id(ship_id) -> Optional[int]:
     try:
         value = int(ship_id)
@@ -950,6 +1050,25 @@ def attach_credits_payload(data: dict, state: dict, entry: dict) -> None:
         data['credits'] = credits
 
 
+def merc_coins_from_statistics(entry: dict) -> Optional[int]:
+    bank = entry.get('Bank_Account')
+    if not isinstance(bank, dict):
+        return None
+    raw = bank.get('MercCoins_Current')
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def attach_merc_coins_payload(data: dict) -> None:
+    if merc_coins_cache is not None:
+        data['mercCoins'] = merc_coins_cache
+
+
 def ship_record_from_stored(
     ship: dict,
     *,
@@ -969,20 +1088,56 @@ def ship_record_from_stored(
         'inTransit': in_transit,
         'starSystem': star_system or ship.get('StarSystem'),
     }
+    ship_ident = ship.get('ShipIdent') or ship.get('UserShipId')
+    if isinstance(ship_ident, str) and ship_ident.strip():
+        record['ident'] = ship_ident.strip()
     return record
+
+
+def _merge_ship_record(ship: dict) -> Optional[tuple]:
+    if not isinstance(ship, dict):
+        return None
+    ship_id = normalize_ship_id(ship.get('shipId'))
+    if ship_id is None:
+        return None
+    previous = commander_ships_cache.get(ship_id, {})
+    return ship_id, {**previous, **ship, 'shipId': ship_id}
 
 
 def merge_ships_into_cache(ships: list) -> None:
     global commander_ships_cache
     for ship in ships:
-        if not isinstance(ship, dict):
+        merged = _merge_ship_record(ship)
+        if merged is None:
             continue
-        ship_id = normalize_ship_id(ship.get('shipId'))
-        if ship_id is None:
+        ship_id, record = merged
+        commander_ships_cache[ship_id] = record
+
+
+def replace_ships_cache(ships: list) -> None:
+    """Replace the cache with this inventory. Keep stored details for ships that remain."""
+    global commander_ships_cache
+    incoming = {}
+    for ship in ships:
+        merged = _merge_ship_record(ship)
+        if merged is None:
             continue
-        previous = commander_ships_cache.get(ship_id, {})
-        merged = {**previous, **ship, 'shipId': ship_id}
-        commander_ships_cache[ship_id] = merged
+        ship_id, record = merged
+        incoming[ship_id] = record
+    commander_ships_cache = incoming
+
+
+def prune_ships_cache(keep_ids: set) -> None:
+    global commander_ships_cache
+    commander_ships_cache = {
+        ship_id: ship
+        for ship_id, ship in commander_ships_cache.items()
+        if ship_id in keep_ids
+    }
+
+
+def remove_ship_from_cache(ship_id: int) -> None:
+    commander_ships_cache.pop(ship_id, None)
 
 
 def build_ships_payload(
@@ -1020,17 +1175,23 @@ def build_ships_payload(
     return payload
 
 
-def handle_stored_ships_event(entry: dict, system: str) -> None:
+def handle_stored_ships_event(entry: dict, system: str, active_ship_id: Optional[int] = None) -> bool:
+    """StoredShips lists every ship in storage. The ship being flown is kept too."""
+    ships_here = entry.get('ShipsHere')
+    ships_remote = entry.get('ShipsRemote')
+    if not isinstance(ships_here, list) and not isinstance(ships_remote, list):
+        return False
+
     star_system = entry.get('StarSystem') or system
     batch = []
 
-    for ship in entry.get('ShipsHere') or []:
+    for ship in ships_here or []:
         if isinstance(ship, dict):
             record = ship_record_from_stored(ship, star_system=star_system, in_transit=False)
             if record:
                 batch.append(record)
 
-    for ship in entry.get('ShipsRemote') or []:
+    for ship in ships_remote or []:
         if not isinstance(ship, dict):
             continue
         in_transit = bool(ship.get('InTransit'))
@@ -1042,8 +1203,17 @@ def handle_stored_ships_event(entry: dict, system: str) -> None:
         if record:
             batch.append(record)
 
+    keep_ids = {record['shipId'] for record in batch}
+    active_id = active_ship_id if active_ship_id is not None else active_ship_id_cache
+    if active_id is not None:
+        keep_ids.add(active_id)
+    if not keep_ids:
+        return False
+
     if batch:
         merge_ships_into_cache(batch)
+    prune_ships_cache(keep_ids)
+    return True
 
 
 def normalize_engineering(raw) -> Optional[dict]:
@@ -1230,23 +1400,253 @@ def enqueue_fuel_update(
             'active': True,
         }])
 
-    payload = {
-        'cmdr': cmdr,
-        'system': system,
-        'station': station,
-    }
-    payload.update(build_ships_payload(
-        active_ship_id=ship_id,
-        fuel_level=fuel_level,
-        fuel_capacity=fuel_capacity,
-    ))
+    payload = location_payload(cmdr, system, station)
+    payload['fuelLevel'] = fuel_level
+    if fuel_capacity is not None:
+        payload['fuelCapacity'] = fuel_capacity
+
     if send_ship_info_enabled():
+        payload.update(build_ships_payload(
+            active_ship_id=ship_id,
+            fuel_level=fuel_level,
+            fuel_capacity=fuel_capacity,
+        ))
         attach_cargo_payload(payload)
         attach_credits_payload(payload, state, entry)
+
+    enqueue_commander(payload)
+    schedule_on_main_thread(update_status)
+
+
+def cancel_live_fuel_timer() -> None:
+    global live_fuel_timer
+    if live_fuel_timer is not None:
+        live_fuel_timer.cancel()
+        live_fuel_timer = None
+
+
+def fuel_main_from_status(entry: dict) -> Optional[float]:
+    fuel = entry.get('Fuel')
+    if isinstance(fuel, dict):
+        return parse_fuel_level(fuel.get('FuelMain'))
+    return None
+
+
+def send_live_fuel(level: float) -> None:
+    global last_live_fuel_sent_at, last_live_fuel_level, live_fuel_pending
+    last_live_fuel_sent_at = time.time()
+    last_live_fuel_level = level
+    live_fuel_pending = None
+    state = latest_journal_state if isinstance(latest_journal_state, dict) else {}
+    enqueue_fuel_update(
+        current_cmdr,
+        current_system or None,
+        current_station or None,
+        state,
+        {'event': 'Status', 'FuelLevel': level},
+    )
+
+
+def flush_live_fuel() -> None:
+    global live_fuel_timer
+    live_fuel_timer = None
+    level = live_fuel_pending
+    if level is None:
+        return
+    if last_live_fuel_level is not None and abs(level - last_live_fuel_level) < 0.01:
+        return
+    send_live_fuel(level)
+
+
+def schedule_live_fuel(level: float) -> None:
+    global live_fuel_timer, live_fuel_pending
+    compared = last_live_fuel_level if last_live_fuel_level is not None else active_fuel_level_cache
+    if compared is not None and abs(level - compared) < 0.01:
+        return
+
+    wait = FUEL_LIVE_INTERVAL_SEC - (time.time() - last_live_fuel_sent_at)
+    if wait <= 0:
+        cancel_live_fuel_timer()
+        send_live_fuel(level)
+        return
+
+    live_fuel_pending = level
+    if live_fuel_timer is not None:
+        return
+    live_fuel_timer = threading.Timer(wait, flush_live_fuel)
+    live_fuel_timer.daemon = True
+    live_fuel_timer.start()
+
+
+def enqueue_ship_cache(
+    cmdr: Optional[str],
+    system: Optional[str],
+    station: Optional[str],
+    state: dict,
+    entry: dict,
+    *,
+    active_ship_id: Optional[int] = None,
+) -> None:
+    if not send_ship_info_enabled() or not work_queue or not commander_ships_cache:
+        return
+    payload = location_payload(cmdr, system, station)
+    attach_credits_payload(payload, state, entry)
+    payload.update(build_ships_payload(active_ship_id=active_ship_id))
     enqueue_commander(payload)
 
 
-def attach_ship_payload(data: dict, state: dict, entry: dict) -> None:
+def _loadout_modules(ship: dict) -> list:
+    loadout = ship.get('loadout')
+    if not isinstance(loadout, dict):
+        loadout = {}
+        ship['loadout'] = loadout
+    modules = loadout.get('modules')
+    if not isinstance(modules, list):
+        modules = []
+        loadout['modules'] = modules
+    return modules
+
+
+def _find_module(modules: list, slot: Optional[str]):
+    if not slot:
+        return None
+    for module in modules:
+        if isinstance(module, dict) and module.get('slot') == slot:
+            return module
+    return None
+
+
+def apply_module_event(entry: dict) -> bool:
+    """Update the fitted module. Jump range, hull, and rebuy stay until the next Loadout."""
+    ship_id = normalize_ship_id(entry.get('ShipID'))
+    if ship_id is None:
+        return False
+
+    ship = commander_ships_cache.get(ship_id)
+    if ship is None:
+        ship = {
+            'shipId': ship_id,
+            'shipType': entry.get('Ship') or entry.get('ShipType') or 'unknown',
+        }
+        commander_ships_cache[ship_id] = ship
+
+    modules = _loadout_modules(ship)
+    slot = entry.get('Slot')
+    event_name = entry.get('event')
+
+    if event_name == 'ModuleSell':
+        ship['loadout']['modules'] = [
+            module for module in modules
+            if not (isinstance(module, dict) and slot and module.get('slot') == slot)
+        ]
+        return True
+
+    module = _find_module(modules, slot)
+    if module is None:
+        module = {'slot': slot}
+        modules.append(module)
+
+    if event_name == 'ModuleBuy':
+        module['item'] = entry.get('BuyItem')
+        module.pop('engineering', None)
+    elif event_name == 'EngineerCraft':
+        if entry.get('Module'):
+            module['item'] = entry.get('Module')
+        module['engineering'] = {
+            'engineer': entry.get('Engineer'),
+            'blueprintName': entry.get('BlueprintName'),
+            'level': entry.get('Level'),
+            'quality': entry.get('Quality'),
+            'experimentalEffect': entry.get('ApplyExperimentalEffect'),
+        }
+    return True
+
+
+def handle_shipyard_buy(entry: dict, system: Optional[str], state: dict) -> Optional[int]:
+    stored_id = normalize_ship_id(entry.get('StoreShipID'))
+    new_id = normalize_ship_id(entry.get('NewShipID') or entry.get('ShipID'))
+    if new_id is None:
+        state_id = normalize_ship_id(state.get('ShipID'))
+        if state_id is not None and state_id != stored_id:
+            new_id = state_id
+
+    records = []
+    if stored_id is not None:
+        records.append({
+            'shipId': stored_id,
+            'shipType': entry.get('StoreOldShip') or 'unknown',
+            'starSystem': system,
+            'inTransit': False,
+            'active': False,
+        })
+    if new_id is not None:
+        records.append({
+            'shipId': new_id,
+            'shipType': entry.get('ShipType') or state.get('ShipType') or 'unknown',
+            'value': entry.get('ShipPrice'),
+            'starSystem': system,
+            'inTransit': False,
+            'active': True,
+        })
+    if records:
+        merge_ships_into_cache(records)
+    return new_id
+
+
+def handle_shipyard_swap(entry: dict, system: Optional[str]) -> Optional[int]:
+    new_id = normalize_ship_id(entry.get('ShipID'))
+    stored_id = normalize_ship_id(entry.get('StoreShipID'))
+    records = []
+    if stored_id is not None:
+        records.append({
+            'shipId': stored_id,
+            'shipType': entry.get('StoreOldShip') or 'unknown',
+            'starSystem': system,
+            'inTransit': False,
+            'active': False,
+        })
+    if new_id is not None:
+        records.append({
+            'shipId': new_id,
+            'shipType': entry.get('ShipType') or 'unknown',
+            'starSystem': system,
+            'inTransit': False,
+            'active': True,
+        })
+    if records:
+        merge_ships_into_cache(records)
+    return new_id
+
+
+def handle_shipyard_transfer(entry: dict, system: Optional[str]) -> Optional[int]:
+    ship_id = normalize_ship_id(entry.get('ShipID'))
+    if ship_id is None:
+        return None
+    destination = system or entry.get('System')
+    merge_ships_into_cache([{
+        'shipId': ship_id,
+        'shipType': entry.get('ShipType') or 'unknown',
+        'starSystem': destination,
+        'inTransit': True,
+        'active': False,
+    }])
+    return ship_id
+
+
+def handle_set_user_ship_name(entry: dict) -> Optional[int]:
+    ship_id = normalize_ship_id(entry.get('ShipID'))
+    if ship_id is None:
+        return None
+    merge_ships_into_cache([{
+        'shipId': ship_id,
+        'shipType': entry.get('Ship') or 'unknown',
+        'name': entry.get('UserShipName'),
+        'ident': entry.get('UserShipId'),
+    }])
+    return ship_id
+
+
+def attach_ship_payload(data: dict, state: dict, entry: dict, star_system: Optional[str] = None) -> None:
     ship_id, ship_type, ship_name, ship_ident = active_ship_from_state_and_entry(state, entry)
     fuel_level, fuel_capacity = fuel_from_state_and_entry(state, entry)
     loadout = loadout_from_entry(entry)
@@ -1261,6 +1661,9 @@ def attach_ship_payload(data: dict, state: dict, entry: dict) -> None:
             'fuelCapacity': fuel_capacity,
             'active': True,
         }
+        if star_system:
+            ship_record['starSystem'] = star_system
+            ship_record['inTransit'] = False
         if loadout:
             ship_record['loadout'] = loadout
         merge_ships_into_cache([ship_record])
@@ -1283,7 +1686,7 @@ def _api_headers(api_key: str, *, json_body: bool = False) -> dict:
     return headers
 
 
-def _require_api_credentials() -> Optional[tuple[str, str]]:
+def _require_api_credentials() -> Optional[Tuple[str, str]]:
     if not is_plugin_enabled():
         return None
     api_key = get_api_key()
@@ -1302,9 +1705,10 @@ def plugin_start3(plugin_dir: str) -> str:
     Returns:
         The plugin's internal name
     """
-    global work_queue, worker_thread, ping_thread, stop_event, ping_event, update_check_performed
+    global work_queue, worker_thread, ping_thread, update_check_thread
+    global stop_event, ping_event, update_check_performed
     
-    logger.info(f'EDSpec plugin starting from {plugin_dir}')
+    logger.info('EDSpec plugin starting from %s', plugin_dir)
     
     work_queue = queue.Queue()
     update_check_performed = False
@@ -1329,24 +1733,21 @@ def plugin_stop() -> None:
     """
     Cleanup when EDMarketConnector shuts down.
     """
-    global stop_event, ping_event, worker_thread, ping_thread
+    global stop_event, ping_event, worker_thread, ping_thread, update_check_thread
     
     logger.info('EDSpec plugin stopping')
 
-    flush_pending_fss_signals()
     cancel_nav_route_state_retry()
     cancel_route_completion_clear()
+    cancel_live_fuel_timer()
     
     # Send disconnect message before shutting down
     send_disconnect_message()
     
     # Signal threads to stop
-    if stop_event:
-        stop_event.set()
-    if ping_event:
-        ping_event.set()
-    if update_check_event:
-        update_check_event.set()
+    stop_event.set()
+    ping_event.set()
+    update_check_event.set()
     
     # Wait for threads to finish (max 5 seconds each)
     if worker_thread:
@@ -1388,6 +1789,144 @@ def plugin_app(parent: tk.Frame) -> Tuple[tk.Label, tk.Label]:
     return label, status_label
 
 
+def edmc_api_root() -> str:
+    url = get_api_url().rstrip('/')
+    suffix = '/edmc/ingest'
+    if url.endswith(suffix):
+        return url[:-len(suffix)]
+    parsed = urlparse(url)
+    return f'{parsed.scheme}://{parsed.netloc}'
+
+
+def fit_photo(image: tk.PhotoImage, size: int) -> tk.PhotoImage:
+    edge = max(image.width(), image.height(), 1)
+    factor = edge // size
+    if factor > 1:
+        return image.subsample(factor, factor)
+    return image
+
+
+def photo_from_b64(data: str, size: int) -> Optional[tk.PhotoImage]:
+    if not data:
+        return None
+    try:
+        return fit_photo(tk.PhotoImage(data=data), size)
+    except tk.TclError:
+        logger.debug('Could not read an embedded logo')
+        return None
+
+
+def photo_from_bytes(raw: bytes, size: int) -> Optional[tk.PhotoImage]:
+    return photo_from_b64(base64.b64encode(raw).decode('ascii'), size)
+
+
+def _api_get(session, path: str):
+    return session.get(f'{edmc_api_root()}{path}', timeout=8)
+
+
+def fetch_season_brand(session) -> Optional[dict]:
+    try:
+        response = _api_get(session, '/season')
+        if getattr(response, 'status_code', 0) != 200:
+            return None
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        logger.debug('Could not load the season from the API')
+        return None
+
+
+def png_bytes(raw: bytes) -> Optional[bytes]:
+    if raw.startswith(b'\x89PNG'):
+        return raw
+    return None
+
+
+def fetch_api_png(session, path: str) -> Optional[bytes]:
+    try:
+        response = _api_get(session, path)
+        raw = getattr(response, 'content', b'') or b''
+        if getattr(response, 'status_code', 0) == 200:
+            return png_bytes(raw)
+    except Exception:
+        logger.debug('Could not download the season image')
+    return None
+
+
+def logo_bytes_from_brand(brand: Optional[dict]) -> Optional[bytes]:
+    if not isinstance(brand, dict):
+        return None
+    encoded = brand.get('logo')
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    try:
+        return png_bytes(base64.b64decode(encoded, validate=True))
+    except Exception:
+        logger.debug('Could not read the season logo from the API')
+        return None
+
+
+def fetch_png_url(session, url: Optional[str]) -> Optional[bytes]:
+    if not isinstance(url, str) or not url.startswith('https://'):
+        return None
+    try:
+        response = session.get(
+            url,
+            timeout=8,
+            headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'image/png,image/*,*/*'},
+        )
+        raw = getattr(response, 'content', b'') or b''
+        if getattr(response, 'status_code', 0) == 200:
+            return png_bytes(raw)
+    except Exception:
+        logger.debug('Could not download the season image')
+    return None
+
+
+def refresh_season_images(
+    logo_label: tk.Label,
+    greeting: tk.Frame,
+    greeting_label: tk.Label,
+    pumpkin_label: tk.Label,
+) -> None:
+    def work() -> None:
+        try:
+            session = timeout_session.new_session()
+        except Exception:
+            logger.debug('Could not open a session for the season logo')
+            return
+        brand = fetch_season_brand(session)
+        logo_raw = logo_bytes_from_brand(brand) or fetch_api_png(session, '/season/logo')
+        pumpkin_raw = None
+        if isinstance(brand, dict) and brand.get('season') == 'halloween':
+            pumpkin_raw = fetch_png_url(session, 'https://edspecbot.com/pumpkin.png')
+
+        def apply() -> None:
+            try:
+                if logo_raw:
+                    photo = photo_from_bytes(logo_raw, 48)
+                    if photo is not None:
+                        logo_label.configure(image=photo)
+                        logo_label.image = photo
+                greeting_text = brand.get('message') if isinstance(brand, dict) else None
+                if isinstance(greeting_text, str) and greeting_text.strip():
+                    greeting_label.configure(text=greeting_text.strip())
+                    if pumpkin_raw:
+                        photo = photo_from_bytes(pumpkin_raw, 20)
+                        if photo is not None:
+                            pumpkin_label.configure(image=photo)
+                            pumpkin_label.image = photo
+                            pumpkin_label.pack(side=tk.LEFT, padx=(6, 0))
+                    if not greeting.winfo_ismapped():
+                        greeting.pack(anchor=tk.W, pady=(2, 0))
+            except tk.TclError:
+                return
+
+        schedule_on_main_thread(apply)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Frame:
     """
     Create the preferences panel in EDMarketConnector settings.
@@ -1402,141 +1941,233 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Fra
     """
     global prefs_frame
     
-    logger.debug(f'plugin_prefs called: cmdr={cmdr}, is_beta={is_beta}')
+    logger.debug('plugin_prefs called: cmdr=%s, is_beta=%s', cmdr, is_beta)
     
-    # Create the frame - this must succeed
     try:
         frame = nb.Frame(parent)
-        frame.columnconfigure(1, weight=1)
-    except Exception as e:
-        logger.exception(f'Error creating preferences frame: {e}')
-        # Last resort - create minimal frame
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+    except Exception:
+        logger.exception('Error creating preferences frame')
         frame = nb.Frame(parent)
-        nb.Label(frame, text='Error: Could not create EDSpec preferences frame').pack()
+        nb.Label(frame, text='EDSpec settings could not be opened. Please try again.').pack()
         return frame
     
-    # Wrap all widget creation in try-except to ensure frame is always returned
     try:
-        # Title - EDSpec styled
-        try:
-            title_label = nb.Label(frame, text='EDSpec', font=('Helvetica', 18, 'bold'))
-            title_label.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(15, 8), padx=(20, 5))
-        except Exception as e:
-            logger.exception(f'Error creating title label: {e}')
-            # Fallback to simple label without font
-            title_label = nb.Label(frame, text='EDSpec')
-            title_label.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(15, 8), padx=(20, 5))
-        # Subtitle
-        nb.Label(frame, text='A Discord bot for Elite Dangerous!', font=('Helvetica', 10)).grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 25), padx=(20, 5)
-        )
-        
-        # Description section
-        desc_text = (
-            'Connect your Elite Dangerous game data to EDSpec for the Discord bot and galaxy map.\n\n'
-            'Always shared while you are in game:\n'
-            '• Commander name, current system, and station when docked\n'
-            '• Fuel level (jumps, refuel, and fuel scoop events)\n\n'
-            'Optional (privacy setting below):\n'
-            '• Active ship name, credits, cargo, fleet, and loadout details\n'
-            '• On-foot, docked, or undocked status\n\n'
-            'Fuel warnings, route display, and map audio are configured in the galaxy map '
-            'Settings menu on the EDSpec website, not in ED Market Connector.'
-        )
-        nb.Label(frame, text=desc_text, justify=tk.LEFT, wraplength=550, font=('Helvetica', 9)).grid(
-            row=2, column=0, columnspan=2, sticky=tk.W, pady=(0, 20), padx=(20, 5)
-        )
-        
-        # Enable checkbox
-        enabled_var = tk.BooleanVar(value=is_plugin_enabled())
-        nb.Checkbutton(frame, text='Enable EDSpec integration', variable=enabled_var).grid(
-            row=3, column=0, columnspan=2, sticky=tk.W, pady=10, padx=(20, 5)
-        )
-        
-        # Privacy options section
-        nb.Label(frame, text='Privacy Options:', font=('Helvetica', 10)).grid(
-            row=4, column=0, columnspan=2, sticky=tk.W, pady=(20, 5), padx=(20, 5)
-        )
-        
-        send_ship_info_var = tk.BooleanVar(value=send_ship_info_enabled())
-        nb.Checkbutton(
-            frame,
-            text='Share additional data (ship, credits, cargo, fleet, loadout, on-foot status)',
-            variable=send_ship_info_var,
-        ).grid(
-            row=5, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(40, 5)
-        )
-        
-        nb.Label(
-            frame,
-            text='Note: System, station, and fuel are always shared while Elite is running.',
+        shell = tk.Frame(frame, bg=ED_BG)
+        shell.grid(row=0, column=0, sticky=tk.NW, padx=6, pady=6)
+        brackets = tk.Canvas(shell, bg=ED_BG, highlightthickness=0, bd=0)
+        brackets.place(x=0, y=0, relwidth=1, relheight=1)
+        body = tk.Frame(shell, bg=ED_BG)
+        body.pack(padx=18, pady=16)
+        width_lock = tk.Frame(body, width=456, height=1, bg=ED_BG, bd=0, highlightthickness=0)
+        width_lock.pack(fill=tk.X)
+        width_lock.pack_propagate(False)
+
+        def draw_brackets(_event=None) -> None:
+            brackets.delete('frame')
+            width = shell.winfo_width()
+            height = shell.winfo_height()
+            if width < 8 or height < 8:
+                return
+            arm = 11
+            x0, y0, x1, y1 = 1, 1, width - 2, height - 2
+            for coords in (
+                (x0, y0, x0 + arm, y0),
+                (x0, y0, x0, y0 + arm),
+                (x1, y0, x1 - arm, y0),
+                (x1, y0, x1, y0 + arm),
+                (x0, y1, x0 + arm, y1),
+                (x0, y1, x0, y1 - arm),
+                (x1, y1, x1 - arm, y1),
+                (x1, y1, x1, y1 - arm),
+            ):
+                brackets.create_line(*coords, fill=ED_LINE, tags='frame')
+
+        shell.bind('<Configure>', draw_brackets)
+
+        def option_row(text: str, variable: tk.BooleanVar, note: Optional[str] = None) -> None:
+            holder = tk.Frame(body, bg=ED_BG, cursor='hand2')
+            holder.pack(fill=tk.X, pady=(10, 0))
+            mark = tk.Canvas(holder, width=12, height=12, bg=ED_BG, highlightthickness=0, bd=0, cursor='hand2')
+            mark.pack(side=tk.LEFT, padx=(0, 8), pady=(2, 0))
+            words = tk.Frame(holder, bg=ED_BG, cursor='hand2')
+            words.pack(side=tk.LEFT, fill=tk.X)
+            caption = tk.Label(
+                words,
+                text=text,
+                bg=ED_BG,
+                fg=ED_TEXT,
+                font=ED_FONT,
+                anchor=tk.W,
+                justify=tk.LEFT,
+                wraplength=430,
+                cursor='hand2',
+            )
+            caption.pack(anchor=tk.W)
+            note_label = None
+            if note:
+                note_label = tk.Label(
+                    words,
+                    text=note,
+                    bg=ED_BG,
+                    fg=ED_MUTED,
+                    font=('Segoe UI', 8),
+                    anchor=tk.W,
+                    justify=tk.LEFT,
+                    wraplength=430,
+                    cursor='hand2',
+                )
+                note_label.pack(anchor=tk.W, pady=(1, 0))
+
+            def paint() -> None:
+                mark.delete('box')
+                mark.create_rectangle(0, 0, 12, 12, outline=ED_BG, fill=ED_BG, tags='box')
+                if variable.get():
+                    mark.create_rectangle(1, 1, 11, 11, outline=ED_AMBER, fill=ED_AMBER, tags='box')
+                else:
+                    mark.create_rectangle(1, 1, 11, 11, outline=ED_MUTED, fill=ED_BG, tags='box')
+
+            def toggle(_event=None) -> None:
+                variable.set(not variable.get())
+
+            for widget in (holder, mark, words, caption, note_label):
+                if widget is not None:
+                    widget.bind('<Button-1>', toggle)
+            variable.trace_add('write', lambda *_args: paint())
+            paint()
+
+        def field_block(
+            caption: str,
+            variable: tk.StringVar,
+            show: Optional[str] = None,
+            link_text: Optional[str] = None,
+            link_url: Optional[str] = None,
+        ) -> None:
+            block = tk.Frame(body, bg=ED_BG)
+            block.pack(fill=tk.X, pady=(14, 0))
+            heading = tk.Frame(block, bg=ED_BG)
+            heading.pack(fill=tk.X)
+            tk.Label(heading, text=caption, bg=ED_BG, fg=ED_MUTED, font=('Segoe UI', 8)).pack(side=tk.LEFT)
+            if link_text and link_url:
+                link = tk.Label(
+                    heading,
+                    text=link_text,
+                    bg=ED_BG,
+                    fg=ED_AMBER,
+                    font=('Segoe UI', 8),
+                    cursor='hand2',
+                )
+                link.pack(side=tk.RIGHT)
+                link.bind('<Button-1>', lambda _event: webbrowser.open(link_url))
+                link.bind('<Enter>', lambda _event: link.config(fg=ED_AMBER_HOVER))
+                link.bind('<Leave>', lambda _event: link.config(fg=ED_AMBER))
+            tk.Entry(
+                block,
+                textvariable=variable,
+                show=show,
+                width=48,
+                bg=ED_FIELD,
+                fg=ED_TEXT,
+                insertbackground=ED_AMBER,
+                relief=tk.FLAT,
+                highlightthickness=1,
+                highlightbackground=ED_LINE,
+                highlightcolor=ED_AMBER,
+                font=ED_FONT,
+            ).pack(fill=tk.X, pady=(3, 0), ipady=4)
+
+        head = tk.Frame(body, bg=ED_BG)
+        head.pack(fill=tk.X)
+        tk.Label(head, text=VERSION, bg=ED_BG, fg=ED_MUTED, font=('Segoe UI', 8)).pack(side=tk.RIGHT, pady=(14, 0))
+        logo_label = tk.Label(head, bg=ED_BG, bd=0, highlightthickness=0)
+        logo_label.pack(side=tk.LEFT, padx=(0, 10))
+        names = tk.Frame(head, bg=ED_BG)
+        names.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(names, text='EDSpec', bg=ED_BG, fg=ED_AMBER, font=('Segoe UI', 12)).pack(anchor=tk.W)
+        greeting = tk.Frame(names, bg=ED_BG)
+        greeting_label = tk.Label(greeting, text='', bg=ED_BG, fg=ED_AMBER, font=('Segoe UI', 8))
+        greeting_label.pack(side=tk.LEFT)
+        pumpkin_label = tk.Label(greeting, bg=ED_BG, bd=0, highlightthickness=0)
+        refresh_season_images(logo_label, greeting, greeting_label, pumpkin_label)
+        rule = tk.Frame(body, bg=ED_LINE, height=1, bd=0, highlightthickness=0)
+        rule.pack(fill=tk.X, pady=(8, 8))
+        rule.pack_propagate(False)
+        tk.Label(
+            body,
+            text='Commander location for the Discord bot and the galaxy map.',
+            bg=ED_BG,
+            fg=ED_TEXT,
+            font=ED_FONT,
+            anchor=tk.W,
             justify=tk.LEFT,
-            wraplength=520,
-            font=('Helvetica', 8),
-            foreground='gray',
-        ).grid(
-            row=6, column=0, columnspan=2, sticky=tk.W, pady=(0, 15), padx=(40, 5)
-        )
-        
-        # Update check section
-        nb.Label(frame, text='Updates:', font=('Helvetica', 10)).grid(
-            row=7, column=0, columnspan=2, sticky=tk.W, pady=(20, 5), padx=(20, 5)
+            wraplength=430,
+        ).pack(anchor=tk.W)
+
+        enabled_var = tk.BooleanVar(value=is_plugin_enabled())
+        option_row('Enabled', enabled_var)
+
+        send_ship_info_var = tk.BooleanVar(value=send_ship_info_enabled())
+        option_row(
+            'Share ship, credits, Merc coins, cargo and fleet',
+            send_ship_info_var,
+            'System, station and fuel are always sent.',
         )
         
         check_updates_var = tk.BooleanVar(value=check_updates_enabled())
-        nb.Checkbutton(frame, text='Check for updates on startup', variable=check_updates_var).grid(
-            row=8, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(40, 5)
-        )
-        
-        current_version_label = nb.Label(frame, text=f'Current version: {VERSION}',
-                                         font=('Helvetica', 8), foreground='gray')
-        current_version_label.grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(0, 15), padx=(40, 5))
-        
-        api_url_label = nb.Label(frame, text='API URL:')
-        api_url_label.grid(row=10, column=0, sticky=tk.W, pady=8, padx=(20, 5))
+        option_row('Check for updates', check_updates_var)
+
         api_url_var = tk.StringVar(
             value=(config.get_str(API_URL_SETTING) or '').strip() or DEFAULT_API_URL,
         )
-        api_url_entry = ttk.Entry(frame, textvariable=api_url_var, width=50)
-        api_url_entry.grid(row=10, column=1, sticky=tk.W+tk.E, pady=8, padx=5)
-
-        nb.Label(
-            frame,
-            text='Local dev: http://localhost:4000/edmc/ingest',
-            font=('Helvetica', 8),
-            foreground='gray',
-        ).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(0, 10), padx=(40, 5))
-        
-        # API Key section
-        api_key_label = nb.Label(frame, text='API Key:')
-        api_key_label.grid(row=12, column=0, sticky=tk.W, pady=8, padx=(20, 5))
         api_key_var = tk.StringVar(value=config.get_str(API_KEY_SETTING) or '')
-        # Use ttk.Entry for password field (EntryMenu may not support show parameter)
-        api_key_entry = ttk.Entry(frame, textvariable=api_key_var, width=50, show='*')
-        api_key_entry.grid(row=12, column=1, sticky=tk.W+tk.E, pady=8, padx=5)
-        
-        # Get API Key help text
-        get_key_text = 'Get your API key from https://edspecbot.com'
-        get_key_label = nb.Label(frame, text=get_key_text, cursor='hand2', underline=18)
-        get_key_label.grid(
-            row=13, column=0, columnspan=2, sticky=tk.W, pady=(0, 10), padx=(20, 5)
+        field_block('API URL', api_url_var)
+        field_block(
+            'API key',
+            api_key_var,
+            show='*',
+            link_text='Get an API key here',
+            link_url='https://edspecbot.com',
         )
-        # Configure blue color and make the link clickable
-        get_key_label.config(foreground='#0000FF')  # Explicit blue hex color
-        get_key_label.bind('<Button-1>', lambda e: webbrowser.open('https://edspecbot.com'))
-        get_key_label.bind('<Enter>', lambda e: get_key_label.config(foreground='#fb923c'))
-        get_key_label.bind('<Leave>', lambda e: get_key_label.config(foreground='#0000FF'))
-        
-        # Connection test section
-        test_result_var = tk.StringVar(value='')
-        test_result_label = nb.Label(frame, textvariable=test_result_var, wraplength=500, font=('Helvetica', 9))
-        test_result_label.grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(20, 5))
-        
-        # Cooldown state for test button
+
+        actions = tk.Frame(body, bg=ED_BG)
+        actions.pack(fill=tk.X, pady=(16, 2))
         test_button_cooldown_active = {'value': False}
-        
-        # Create button first so it can be referenced in the function
-        test_button = tk.Button(frame, text='Test Connection')
+        test_button = tk.Label(
+            actions,
+            text='Test connection',
+            bg=ED_BG,
+            fg=ED_AMBER,
+            font=ED_FONT,
+            padx=10,
+            pady=3,
+            highlightthickness=1,
+            highlightbackground=ED_AMBER,
+            highlightcolor=ED_AMBER,
+            cursor='hand2',
+        )
+        test_button.pack(side=tk.LEFT)
+        test_result_var = tk.StringVar(value='')
+        tk.Label(
+            actions,
+            textvariable=test_result_var,
+            bg=ED_BG,
+            fg=ED_MUTED,
+            font=ED_FONT,
+            anchor=tk.W,
+            wraplength=280,
+            justify=tk.LEFT,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(
+            body,
+            text='Route lines, fuel warnings and map audio are set on the galaxy map.',
+            bg=ED_BG,
+            fg=ED_MUTED,
+            font=('Segoe UI', 8),
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=430,
+        ).pack(anchor=tk.W, pady=(14, 0))
         
         def test_connection():
             """Test the connection to the EDSpec API"""
@@ -1544,24 +2175,17 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Fra
             if test_button_cooldown_active['value']:
                 return
             
-            # Activate cooldown
             test_button_cooldown_active['value'] = True
-            test_button.config(state='disabled')
-            original_text = test_button['text']
+            test_button.config(fg=ED_MUTED, highlightbackground=ED_LINE, highlightcolor=ED_LINE, cursor='arrow')
             
             def reenable_button():
                 test_button_cooldown_active['value'] = False
-                test_button.config(state='normal', text=original_text)
-            
-            def update_cooldown_text(seconds_left):
-                if seconds_left > 0:
-                    test_button.config(text=f'Test Connection (cooldown: {seconds_left}s)')
-                    frame.after(1000, lambda: update_cooldown_text(seconds_left - 1))
-                else:
-                    reenable_button()
-            
-            # Start cooldown countdown
-            update_cooldown_text(10)
+                test_button.config(
+                    fg=ED_AMBER,
+                    highlightbackground=ED_AMBER,
+                    highlightcolor=ED_AMBER,
+                    cursor='hand2',
+                )
             
             test_result_var.set('Testing connection...')
             frame.update_idletasks()
@@ -1577,7 +2201,11 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Fra
             current_api_url = api_url_var.get().strip() or DEFAULT_API_URL
             
             def set_test_result(message: str) -> None:
-                schedule_on_main_thread(lambda: test_result_var.set(message))
+                def apply() -> None:
+                    test_result_var.set(message)
+                    reenable_button()
+
+                schedule_on_main_thread(apply)
             
             def do_test():
                 try:
@@ -1601,32 +2229,31 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Fra
                     elif response.status_code == 401:
                         set_test_result('Authentication failed. Check your API key.')
                     else:
-                        set_test_result(f'Unexpected response: {response.status_code}')
+                        set_test_result('Unexpected response from the server. Please try again.')
                         
-                except Exception as e:
-                    error_msg = str(e)
+                except Exception as exc:
+                    error_msg = str(exc)
                     if 'getaddrinfo failed' in error_msg or 'NameResolutionError' in error_msg:
                         set_test_result('Could not reach the server. Check the URL.')
                     elif 'Connection refused' in error_msg:
-                        set_test_result('Connection refused. The server may be down.')
+                        set_test_result('Could not connect. Please try again.')
                     else:
-                        set_test_result('Connection test failed. Check the log for details.')
-                    logger.debug('Connection test failed: %s', e)
+                        set_test_result('Connection test failed. Please try again.')
+                    logger.debug('Connection test failed: %s', exc)
             
             # Run test in a thread to avoid blocking UI
             threading.Thread(target=do_test, daemon=True).start()
         
-        # Set the command after function is defined
-        test_button.config(command=test_connection)
-        test_button.grid(row=15, column=0, columnspan=2, sticky=tk.W, pady=5, padx=(20, 5))
-        
-        # Store references for prefs_changed and prefs_cmdr_changed
+        test_button.bind('<Button-1>', lambda _event: test_connection())
+        test_button.bind('<Enter>', lambda _event: test_button.config(fg=ED_AMBER_HOVER) if not test_button_cooldown_active['value'] else None)
+        test_button.bind('<Leave>', lambda _event: test_button.config(fg=ED_AMBER) if not test_button_cooldown_active['value'] else None)
+
+        body.lift()
         frame.enabled_var = enabled_var
         frame.api_url_var = api_url_var
         frame.api_key_var = api_key_var
         frame.send_ship_info_var = send_ship_info_var
         frame.check_updates_var = check_updates_var
-        frame.enabled_checkbutton = None  # Will be set if we need to reference it
         
         # Store the frame globally so prefs_changed can access it
         prefs_frame = frame
@@ -1634,16 +2261,16 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str | None, is_beta: bool) -> nb.Fra
         # Initialize UI based on current commander (if needed)
         try:
             prefs_cmdr_changed(cmdr, is_beta)
-        except Exception as e:
-            logger.exception(f'Error in prefs_cmdr_changed: {e}')
+        except Exception:
+            logger.exception('Error in prefs_cmdr_changed')
         
         logger.debug('plugin_prefs returning frame')
-    except Exception as e:
-        logger.exception(f'Error in plugin_prefs widget creation: {e}')
+    except Exception:
+        logger.exception('Error in plugin_prefs widget creation')
         # Clear frame and add error message
         for widget in frame.winfo_children():
             widget.destroy()
-        nb.Label(frame, text=f'Error loading EDSpec preferences: {str(e)[:100]}').pack()
+        nb.Label(frame, text='EDSpec settings could not be loaded. Please try again.').pack()
         # Still return the frame so the tab appears
         prefs_frame = frame
     
@@ -1744,13 +2371,13 @@ def update_status() -> None:
                 status_label['text'] = 'Connection failed'
                 status_label['foreground'] = 'red'
             elif not game_session_active:
-                status_label['text'] = 'PLEASE START GAME'
+                status_label['text'] = 'Please join a game mode'
                 status_label['foreground'] = 'orange'
             else:  # disconnected or unknown
                 status_label['text'] = 'Disconnected'
                 status_label['foreground'] = 'red'
             
-    except Exception as e:
+    except Exception:
         logger.exception('Error updating status')
         status_label['text'] = 'Error'
         status_label['foreground'] = 'red'
@@ -1788,37 +2415,9 @@ def _worker_send_commander(session, data: dict) -> None:
             _set_connection_status('red', auth_failed=True)
         else:
             logger.warning('Unexpected response from EDSpec: %s', response.status_code)
-            _set_connection_status('orange')
+            _set_connection_status('red')
     except Exception as exc:
         logger.error('Failed to send data to EDSpec: %s', exc)
-        _set_connection_status('red')
-
-
-def _worker_send_fss_signals(session, data: dict) -> None:
-    creds = _require_api_credentials()
-    if not creds:
-        logger.debug('Plugin disabled or no API key, skipping FSS send')
-        return
-    api_url, api_key = creds
-    try:
-        response = session.post(
-            api_url,
-            json=data,
-            headers=_api_headers(api_key, json_body=True),
-            timeout=10,
-        )
-        if response.status_code == 200:
-            signal_count = len((data.get('fssSignals') or {}).get('signals') or [])
-            logger.debug('Sent %s expiring FSS signal(s) to EDSpec', signal_count)
-            _set_connection_status('green')
-        elif response.status_code == 401:
-            logger.warning('Authentication failed - check your API key')
-            _set_connection_status('red', auth_failed=True)
-        else:
-            logger.warning('Unexpected FSS response from EDSpec: %s', response.status_code)
-            _set_connection_status('orange')
-    except Exception as exc:
-        logger.error('Failed to send FSS signals to EDSpec: %s', exc)
         _set_connection_status('red')
 
 
@@ -1854,7 +2453,7 @@ def _worker_ping(session, connected: bool) -> None:
 
 
 def worker_thread_loop() -> None:
-    """Background worker: all HTTP to EDSpec (commander, route, ping, FSS)."""
+    """Background worker: all HTTP to EDSpec (commander, route, ping)."""
     session = timeout_session.new_session()
 
     while not stop_event.is_set():
@@ -1874,14 +2473,11 @@ def worker_thread_loop() -> None:
                 _worker_delete_route(session)
             elif kind == JOB_ROUTE_STATE_RETRY:
                 _worker_route_state_retry(int(payload or 0))
-            elif kind == JOB_FSS_SIGNALS:
-                _worker_send_fss_signals(session, payload)
 
             work_queue.task_done()
         except Exception:
             logger.exception('Error in worker thread loop')
-        time.sleep(1)
-    
+
 
 def send_disconnect_message() -> None:
     """Synchronous disconnect ping during plugin_stop (no UI updates)."""
@@ -1944,10 +2540,10 @@ def check_for_updates_delayed() -> None:
             return
         
         if is_newer_version(latest_version, VERSION):
-            logger.info(f'Update available: {VERSION} -> {latest_version}')
+            logger.info('Update available: %s -> %s', VERSION, latest_version)
             schedule_on_main_thread(lambda: show_update_dialog(latest_version))
-    except Exception as e:
-        logger.exception(f'Update check failed: {e}')
+    except Exception:
+        logger.exception('Update check failed')
     finally:
         update_check_performed = True
 
@@ -1972,24 +2568,23 @@ def get_latest_version() -> Optional[str]:
                     version_str = cleaned_tag
             
             if not version_str and release_name:
-                import re
                 version_match = re.search(r'(?:v)?(\d+\.\d+(?:\.\d+)?)', release_name, re.IGNORECASE)
                 if version_match:
                     version_str = version_match.group(1)
             
             if not version_str:
-                logger.warning(f'No version found in tag "{tag_name}" or name "{release_name}"')
+                logger.warning('No version found in tag "%s" or name "%s"', tag_name, release_name)
                 return None
             
             return version_str
         elif response.status_code == 404:
-            logger.warning(f'Repo not found: {GITHUB_REPO}')
+            logger.warning('Repo not found: %s', GITHUB_REPO)
             return None
         else:
-            logger.warning(f'GitHub API error: {response.status_code}')
+            logger.warning('GitHub API error: %s', response.status_code)
             return None
-    except Exception as e:
-        logger.warning(f'Failed to fetch version: {e}')
+    except Exception as exc:
+        logger.warning('Failed to fetch version: %s', exc)
         return None
 
 
@@ -2010,8 +2605,8 @@ def is_newer_version(latest: str, current: str) -> bool:
                 return False
         
         return False
-    except Exception as e:
-        logger.debug(f'Version comparison failed: {e}')
+    except Exception as exc:
+        logger.debug('Version comparison failed: %s', exc)
         return False
 
 
@@ -2040,8 +2635,43 @@ def show_update_dialog(latest_version: str) -> None:
             releases_url = f'https://github.com/{GITHUB_REPO}/releases/latest'
             webbrowser.open(releases_url)
             
-    except Exception as e:
+    except Exception:
         logger.exception('Error showing update dialog')
+
+
+def journal_id_string(value: object) -> Optional[str]:
+    """Elite ids are 64-bit. Send them as strings so JSON does not round them."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            return None
+        return str(int(text))
+    if isinstance(value, int):
+        if value < 0:
+            return None
+        return str(value)
+    return None
+
+
+def flight_log_from_journal(entry: dict) -> Optional[dict]:
+    """Story event for flight logs. Names are not included."""
+    event_name = entry.get('event')
+    if event_name not in ('FSDJump', 'CarrierJump', 'Location', 'Docked', 'Undocked'):
+        return None
+    system_address = journal_id_string(entry.get('SystemAddress'))
+    if not system_address:
+        return None
+    timestamp = entry.get('timestamp')
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    return {
+        'systemAddress': system_address,
+        'marketId': journal_id_string(entry.get('MarketID')),
+        'event': event_name,
+        'eventAt': timestamp.strip(),
+    }
 
 
 def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: dict, state: dict) -> Optional[str]:
@@ -2059,8 +2689,9 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
     Returns:
         None or error message string
     """
-    global current_cmdr, current_system, latest_journal_state, game_session_start_ts
+    global current_cmdr, current_system, current_station, latest_journal_state, game_session_start_ts
     global last_enqueued_route_signature, route_trust_state_nav_route, suppressed_fsd_target
+    global merc_coins_cache, route_jump_hold, route_jump_released_at
     
     try:
         latest_journal_state = state if isinstance(state, dict) else {}
@@ -2069,11 +2700,13 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
             current_cmdr = cmdr
         if system:
             current_system = system
-
         event_name = entry.get('event')
+        if event_name == 'Undocked':
+            current_station = ''
+        elif isinstance(station, str):
+            current_station = station
 
         if event_name in ('Shutdown', 'ShutDown'):
-            flush_pending_fss_signals()
             game_session_start_ts = None
             last_enqueued_route_signature = None
             set_game_session_active(False)
@@ -2084,7 +2717,20 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
             last_enqueued_route_signature = None
             route_trust_state_nav_route = False
             suppressed_fsd_target = None
+            route_jump_hold = False
+            cancel_route_cancel_confirm()
             set_game_session_active(True)
+
+        if event_name == 'Statistics':
+            coins = merc_coins_from_statistics(entry)
+            if coins is not None:
+                merc_coins_cache = coins
+                if game_session_active and send_ship_info_enabled() and work_queue:
+                    enqueue_commander({
+                        **location_payload(cmdr, system, station),
+                        'mercCoins': coins,
+                    })
+            return None
 
         if event_name == 'StartUp':
             sync_game_session_from_journal(cmdr, system, state)
@@ -2102,13 +2748,11 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
         if not game_session_active:
             return None
 
+        if event_name == 'StartJump' and entry.get('JumpType') == 'Hyperspace':
+            route_jump_hold = True
+
         if event_name == 'NavRouteClear':
-            cancel_route_completion_clear()
-            if active_route and not is_route_complete():
-                logger.debug('Ignoring NavRouteClear mid-route (hyperspace)')
-                return None
-            logger.info('In-game nav route cleared; removing EDSpec route plot')
-            request_route_clear_from_game()
+            request_route_clear_from_game(state)
             return None
 
         if event_name in ('NavRoute', 'Route'):
@@ -2119,21 +2763,10 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
             handle_fsd_target(entry, state)
             return None
 
-        if event_name == 'FSSSignalDiscovered':
-            queue_fss_signal_from_entry(entry)
-            return None
-
-        if event_name == 'FSDJump':
-            flush_pending_fss_signals()
-
         if event_name == 'Cargo':
             update_cargo_cache(entry, state)
             if send_ship_info_enabled() and work_queue:
-                payload = {
-                    'cmdr': cmdr,
-                    'system': system,
-                    'station': station,
-                }
+                payload = location_payload(cmdr, system, station)
                 ship_id, _, ship_name, _ = active_ship_from_state_and_entry(state, entry)
                 if ship_name:
                     payload['ship'] = ship_name
@@ -2145,16 +2778,51 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
                 enqueue_commander(payload)
             return None
 
-        if event_name == 'StoredShips':
-            handle_stored_ships_event(entry, system)
-            if send_ship_info_enabled() and work_queue and commander_ships_cache:
-                payload = {
-                    'cmdr': cmdr,
-                    'system': system,
-                    'station': station,
-                }
+        if event_name == 'ShipyardBuy':
+            new_id = handle_shipyard_buy(entry, system, state)
+            enqueue_ship_cache(cmdr, system, station, state, entry, active_ship_id=new_id)
+            return None
+
+        if event_name == 'ShipyardSwap':
+            new_id = handle_shipyard_swap(entry, system)
+            enqueue_ship_cache(cmdr, system, station, state, entry, active_ship_id=new_id)
+            return None
+
+        if event_name == 'ShipyardTransfer':
+            handle_shipyard_transfer(entry, system)
+            enqueue_ship_cache(cmdr, system, station, state, entry)
+            return None
+
+        if event_name == 'SetUserShipName':
+            handle_set_user_ship_name(entry)
+            enqueue_ship_cache(cmdr, system, station, state, entry)
+            return None
+
+        if event_name in ('ModuleBuy', 'ModuleSell', 'EngineerCraft'):
+            if apply_module_event(entry):
+                enqueue_ship_cache(cmdr, system, station, state, entry)
+            return None
+
+        if event_name == 'ShipyardSell':
+            sold_id = normalize_ship_id(entry.get('SellShipID'))
+            if sold_id is not None and send_ship_info_enabled() and work_queue:
+                remove_ship_from_cache(sold_id)
+                payload = location_payload(cmdr, system, station)
+                payload['removedShipIds'] = [sold_id]
                 attach_credits_payload(payload, state, entry)
                 payload.update(build_ships_payload())
+                enqueue_commander(payload)
+            return None
+
+        if event_name == 'StoredShips':
+            active_id, _, _, _ = active_ship_from_state_and_entry(state, entry)
+            inventory_complete = handle_stored_ships_event(entry, system, active_ship_id=active_id)
+            if send_ship_info_enabled() and work_queue and commander_ships_cache:
+                payload = location_payload(cmdr, system, station)
+                attach_credits_payload(payload, state, entry)
+                payload.update(build_ships_payload())
+                if inventory_complete:
+                    payload['shipsComplete'] = True
                 enqueue_commander(payload)
             return None
 
@@ -2175,21 +2843,20 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
                         'fuelCapacity': fuel_capacity,
                         'active': True,
                     }
+                    if system:
+                        ship_record['starSystem'] = system
+                        ship_record['inTransit'] = False
                     if loadout:
                         ship_record['loadout'] = loadout
                     merge_ships_into_cache([ship_record])
                 if ship_id is not None and work_queue:
-                    payload = {
-                        'cmdr': cmdr,
-                        'system': system,
-                        'station': station,
-                        'ship': ship_name or ship_type,
-                        **build_ships_payload(
+                    payload = location_payload(cmdr, system, station)
+                    payload['ship'] = ship_name or ship_type
+                    payload.update(build_ships_payload(
                             active_ship_id=ship_id,
                             fuel_level=fuel_level,
                             fuel_capacity=fuel_capacity,
-                        ),
-                    }
+                    ))
                     attach_cargo_payload(payload)
                     attach_credits_payload(payload, state, entry)
                     enqueue_commander(payload)
@@ -2199,9 +2866,34 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
         if event_name in ('Refuel', 'RefuelAll', 'FuelScoop'):
             enqueue_fuel_update(cmdr, system, station, state, entry)
             return None
-        
+
+        if event_name == 'Scan':
+            enqueue_fss_scan(cmdr, system, entry)
+            return None
+
+        if event_name == 'SAAScanComplete':
+            enqueue_fss_mapped(cmdr, system, entry)
+            return None
+
+        if event_name == 'FSSDiscoveryScan':
+            enqueue_fss_progress(cmdr, system, entry)
+            return None
+
+        if event_name == 'FSSAllBodiesFound':
+            enqueue_fss_scan_complete(cmdr, system, entry)
+            return None
+
         # Only send on specific events to avoid spam
-        events_to_send_on = ['FSDJump', 'Location', 'Docked', 'Undocked', 'Loadout', 'Embark', 'Disembark']
+        events_to_send_on = [
+            'FSDJump',
+            'CarrierJump',
+            'Location',
+            'Docked',
+            'Undocked',
+            'Loadout',
+            'Embark',
+            'Disembark',
+        ]
         
         if event_name not in events_to_send_on:
             return None
@@ -2219,13 +2911,8 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
         
         send_ship_info = send_ship_info_enabled()
         report_station = None if event_name == 'Undocked' else station
-        
-        # Prepare simplified data to send (location is always sent)
-        data = {
-            'cmdr': cmdr,
-            'system': system,
-            'station': report_station,
-        }
+
+        data = location_payload(cmdr, system, report_station)
         
         # Add ship info if enabled
         if send_ship_info:
@@ -2241,12 +2928,25 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
             credits = credits_from_state_and_entry(state, entry)
             if credits is not None:
                 data['credits'] = credits
+            attach_merc_coins_payload(data)
             data['status'] = status
-            attach_ship_payload(data, state, entry)
-        elif event_name in ('Undocked', 'Docked', 'FSDJump'):
+            attach_ship_payload(data, state, entry, star_system=system)
+        else:
             data['status'] = status
-            attach_ship_payload(data, state, entry)
+            fuel_level, fuel_capacity = fuel_from_state_and_entry(state, entry)
+            if fuel_level is not None:
+                data['fuelLevel'] = fuel_level
+            if fuel_capacity is not None:
+                data['fuelCapacity'] = fuel_capacity
         
+        flight_log = flight_log_from_journal(entry)
+        if flight_log:
+            data['flightLog'] = flight_log
+
+        if event_name == 'FSDJump':
+            route_jump_hold = False
+            route_jump_released_at = time.time()
+
         apply_system_to_route_progress(system)
         hop_idx = effective_hop_index()
         if hop_idx >= 0:
@@ -2262,6 +2962,27 @@ def journal_entry(cmdr: str, is_beta: bool, system: str, station: str, entry: di
         return JOURNAL_ERROR_MESSAGE
     
     return None
+
+
+def dashboard_entry(cmdr: str, is_beta: bool, entry: dict) -> None:
+    """Push the ship's main tank from status.json while fuel is burning or scooping."""
+    global current_cmdr
+    try:
+        if not isinstance(entry, dict) or not is_plugin_enabled() or not game_session_active:
+            return
+        if not current_system:
+            return
+        flags = entry.get('Flags')
+        if isinstance(flags, int) and flags & (IN_SRV_FLAG | IN_FIGHTER_FLAG):
+            return
+        level = fuel_main_from_status(entry)
+        if level is None:
+            return
+        if cmdr:
+            current_cmdr = cmdr
+        schedule_live_fuel(level)
+    except Exception:
+        logger.exception('Error in dashboard_entry')
 
 
 def cmdr_data(data: dict, is_beta: bool) -> None:
@@ -2314,19 +3035,24 @@ def cmdr_data(data: dict, is_beta: bool) -> None:
                         ship_id = normalize_ship_id(ship.get('id'))
                         if ship_id is None:
                             continue
-                        ships_batch.append({
+                        ship_record = {
                             'shipId': ship_id,
                             'shipType': ship.get('shipType') or ship.get('ship_type') or 'unknown',
                             'name': ship.get('name'),
                             'value': ship.get('value'),
                             'active': current_ship_id is not None and ship_id == current_ship_id,
-                        })
+                        }
+                        ship_ident = ship.get('ident') or ship.get('shipIdent')
+                        if isinstance(ship_ident, str) and ship_ident.strip():
+                            ship_record['ident'] = ship_ident.strip()
+                        ships_batch.append(ship_record)
                         if current_ship_id is not None and ship_id == current_ship_id:
                             capi_data['ship'] = ship.get('name', 'Unknown')
 
                 if ships_batch:
-                    merge_ships_into_cache(ships_batch)
+                    replace_ships_cache(ships_batch)
                     capi_data.update(build_ships_payload(active_ship_id=current_ship_id))
+                    capi_data['shipsComplete'] = True
         
         # Queue data for sending
         if work_queue and capi_data:
@@ -2336,7 +3062,3 @@ def cmdr_data(data: dict, is_beta: bool) -> None:
     except Exception:
         logger.exception('Error in cmdr_data')
 
-
-def cmdr_data_legacy(data: dict, is_beta: bool) -> None:
-    """Legacy galaxy CAPI uses a separate callback; same payload handling as Live."""
-    cmdr_data(data, is_beta)

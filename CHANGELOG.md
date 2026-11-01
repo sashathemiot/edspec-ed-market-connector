@@ -1,5 +1,50 @@
 # Changelog
 
+## [1.1.0] - 2026-11-01
+
+### Added
+
+- Fuel level updates while you fly, scoop, or jump.
+- Merc coin balance is saved with extra ship data.
+- Buying, switching, transferring, or renaming a ship updates your hangar right away.
+- Module changes update that module. Jump range, hull, and rebuy update on the next loadout.
+
+### Changed
+
+- Updated the settings screen.
+- Idle status now says Please join a game mode.
+- A jump or dock updates the current ship's system right away.
+
+### Fixed
+
+- Sold ships leave the hangar. A full ship list also drops ships you no longer own.
+
+### Removed
+
+- The local address hint is gone, and FSS signals are no longer shared.
+
+## [1.0.3] - 2026-07-23
+
+### Changed
+
+- Clarified GPL-3.0 license in README and `load.py` copyright header
+- Improved logging style for PEP8 / EDMC review readiness
+- Prepared official plugin browser listing package (`EDSpec-1.0.3.zip`)
+- Raised minimum requirement to EDMarketConnector 6.1.0+ (Plugin Browser and modern config API)
+- Removed legacy EDMC config API shims for versions before 5.0
+
+### Fixed
+
+- Restored connection-test exception handling (broken indent that prevented prefs test errors from being caught)
+- Declared `update_check_thread` as global so shutdown can join the update checker
+- Removed 1-second worker sleep after every HTTP job (queue timeout already paces idle work)
+- Stopped sending fleet/cargo/loadout when the privacy option is off (fuel/status only)
+- Avoided showing raw HTTP status codes in the connection test UI
+- Aligned README privacy docs with actual always-shared vs optional fields
+- Softened preferences error UI copy (no raw exception text)
+
+---
+
 ## [1.0.2] - 2026-07-02
 
 ### Added
